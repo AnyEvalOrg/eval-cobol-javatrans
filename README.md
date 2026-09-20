@@ -142,7 +142,7 @@ inspect eval cobol_javatrans/java_to_cobol --model <provider/model> -T sandbox_t
 Compose builds `cobol_javatrans/Dockerfile`, disables network access, and limits the
 container to 1 CPU, 2 GiB memory, and 128 processes. The Dockerfile is adapted from
 the supplied shared sandbox Dockerfile: that file had OpenJDK 21; this package uses
-**OpenJDK 21** as requested, with `python:3.12-slim-bookworm` to provide it. It installs
+**OpenJDK 21** as requested, with `python:3.12-slim-trixie` to provide it. It installs
 GnuCOBOL, procps, util-linux, and hostname, and reserves UID/GID 65532. Building the
 image requires package downloads; evaluation does not.
 

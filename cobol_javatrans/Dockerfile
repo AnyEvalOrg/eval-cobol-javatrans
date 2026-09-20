@@ -1,7 +1,7 @@
 # Shared sandbox image for the COBOL evals (COBOL-JavaTrans, NIST COBOL85 conversion).
 # Same contract as eval-livecodebench's image: /usr/local/bin/python3, GNU timeout,
 # procps pkill, dmesg/hostname for provenance, UID/GID 65532 reserved for candidates.
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-trixie
 RUN apt-get update \
     && apt-get install -y --no-install-recommends procps util-linux hostname \
        gnucobol openjdk-21-jdk-headless \
