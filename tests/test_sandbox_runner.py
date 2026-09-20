@@ -1,5 +1,6 @@
 """Authored fixtures only. macOS stubs test protocol mechanics, not containment."""
 import ast
+from functools import partial
 import json
 import os
 from pathlib import Path
@@ -7,7 +8,7 @@ import shutil
 import subprocess
 import sys
 import pytest
-from cobol_javatrans.sandbox_runner import SETUP, RUNNER, CLEANUP_COMMAND
+from cobol_javatrans.sandbox_runner import SETUP, RUNNER, CLEANUP_COMMAND, QUIESCENCE_COMMAND
 from cobol_javatrans.scoring import verify_receipt
 
 
@@ -18,26 +19,27 @@ def prepare(request):
     return json.loads(result.stdout)
 
 
-def run_fixture(compile_code='pass', run_code="print('ok')", timeout=1, output_file=None):
+def run_fixture(compile_code='pass', run_code="print('ok')", timeout=1, output_file=None,
+                real_supervisor=False):
     request = dict(files={'fixture.txt': 'safe authored input'}, argv=[sys.executable, '-I', '-c', compile_code],
                    run_argv=[sys.executable, '-I', '-c', run_code], timeout=timeout, run_timeout=timeout, output_limit=4096)
     if output_file:
         request['output_file'] = output_file
     setup = prepare(request)
     source = RUNNER
-    # Never perform credential changes or UID sweeps on the developer host.
-    # The unmodified source is separately checked below; Linux isolation needs
-    # a disposable root sandbox and is not claimed by these local tests.
-    source = source.replace('libc = ctypes.CDLL(None, use_errno=True)', 'libc = type("Stub", (), {"prctl": lambda *args: 0})()')
-    source = source.replace('os.getuid() != 0', 'False')
-    source = source.replace('os.setgroups([])', 'pass')
-    source = source.replace('os.setresgid(CANDIDATE_GID, CANDIDATE_GID, CANDIDATE_GID)', 'pass')
-    source = source.replace('os.setresuid(CANDIDATE_UID, CANDIDATE_UID, CANDIDATE_UID)', 'pass')
-    source = source.replace('os.chown(candidate_work, CANDIDATE_UID, CANDIDATE_GID)', 'pass')
-    source = source.replace('info.st_uid != CANDIDATE_UID', 'info.st_uid != os.getuid()')
-    source = source.replace('os.killpg(pgid, sig)', 'os.kill(pgid, sig)')
-    start, end = source.index('def sweep_uid():'), source.index('def run_step(')
-    source = source[:start] + 'def sweep_uid():\n    pass\n\n\n' + source[end:]
+    if not real_supervisor:
+        # Never perform credential changes or UID sweeps on the developer host.
+        # Keep file-size limits, overflow detection, and stage gating intact.
+        source = source.replace('libc = ctypes.CDLL(None, use_errno=True)', 'libc = type("Stub", (), {"prctl": lambda *args: 0})()')
+        source = source.replace('os.getuid() != 0', 'False')
+        source = source.replace('os.setgroups([])', 'pass')
+        source = source.replace('os.setresgid(CANDIDATE_GID, CANDIDATE_GID, CANDIDATE_GID)', 'pass')
+        source = source.replace('os.setresuid(CANDIDATE_UID, CANDIDATE_UID, CANDIDATE_UID)', 'pass')
+        source = source.replace('os.chown(candidate_work, CANDIDATE_UID, CANDIDATE_GID)', 'pass')
+        source = source.replace('info.st_uid != CANDIDATE_UID', 'info.st_uid != os.getuid()')
+        source = source.replace('os.killpg(pgid, sig)', 'os.kill(pgid, sig)')
+        start, end = source.index('def sweep_uid():'), source.index('def run_step(')
+        source = source[:start] + 'def sweep_uid():\n    pass\n\n\n' + source[end:]
     try:
         result = subprocess.run([sys.executable, '-I', '-c', source, setup['cwd']],
                                 capture_output=True, text=True, timeout=8)
@@ -48,6 +50,66 @@ def run_fixture(compile_code='pass', run_code="print('ok')", timeout=1, output_f
         return receipt
     finally:
         shutil.rmtree(setup['cwd'], ignore_errors=True)
+
+
+@pytest.fixture
+def output_limit_runner():
+    """Use the real supervisor under the Linux containment suite's opt-in."""
+    real = sys.platform == 'linux' and os.geteuid() == 0 and os.environ.get('CJT_LINUX_CONTAINMENT') == '1'
+    if real:
+        result = subprocess.run(['/usr/bin/pgrep', '-u', '65532'], capture_output=True, timeout=5)
+        assert result.returncode == 1, 'candidate UID must be unused before containment tests'
+    try:
+        yield partial(run_fixture, real_supervisor=real)
+    finally:
+        if real:
+            for command in (CLEANUP_COMMAND, QUIESCENCE_COMMAND):
+                result = subprocess.run(command, capture_output=True, timeout=6)
+                assert result.returncode in ((0, 1) if command == CLEANUP_COMMAND else (0,))
+
+
+def overflowing_writer(target):
+    # Attempt twice the 4096-byte request limit. Ignore SIGXFSZ and handle EFBIG
+    # so a successful child exit forces the supervisor to detect the overflow.
+    # Report stderr's size via stdout, since stderr is absent from the receipt.
+    return f'''import errno, os, signal
+signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+fd = {target}
+remaining = b'x' * 8192
+try:
+    while remaining:
+        remaining = remaining[os.write(fd, remaining):]
+except OSError as exc:
+    if exc.errno != errno.EFBIG:
+        raise
+if fd == 2:
+    print(os.fstat(fd).st_size)
+'''
+
+
+@pytest.mark.parametrize('stream, expected_output', [('stdout', 'x' * 4096), ('stderr', '4096\n')],
+                         ids=['stdout', 'stderr'])
+def test_compile_output_limit_blocks_execution(output_limit_runner, stream, expected_output):
+    receipt = output_limit_runner(
+        compile_code=overflowing_writer('1' if stream == 'stdout' else '2'),
+        run_code="print('MUST_NOT_RUN')",
+    )
+    assert receipt['returncode'] == 0 and not receipt['timeout']
+    assert receipt['overflow'] is True
+    assert receipt['stage'] == 'compile'
+    assert 'MUST_NOT_RUN' not in receipt['output']
+    assert receipt['output'] == expected_output
+
+
+def test_result_file_output_limit(output_limit_runner):
+    receipt = output_limit_runner(
+        run_code=overflowing_writer("os.open('OUT.TXT', os.O_WRONLY | os.O_CREAT, 0o600)"),
+        output_file='OUT.TXT',
+    )
+    assert receipt['returncode'] == 0 and not receipt['timeout']
+    assert receipt['stage'] == 'run'
+    assert receipt['overflow'] is True
+    assert receipt['output'] == 'x' * 4096
 
 
 def test_setup_atomic_private_dirs_and_keys():
