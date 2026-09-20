@@ -4,7 +4,7 @@
 FROM python:3.12-slim-bookworm
 RUN apt-get update \
     && apt-get install -y --no-install-recommends procps util-linux hostname \
-       gnucobol openjdk-17-jdk-headless \
+       gnucobol openjdk-21-jdk-headless \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 65532 cobol-candidate \
     && useradd --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin cobol-candidate
