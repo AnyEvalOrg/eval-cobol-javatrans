@@ -1,0 +1,10 @@
+id: baseline
+version: 1
+description: Source program plus target skeleton, one generation, all-tests pass@1.
+upstream_default: false
+budget:
+  max_turns: 1
+  max_tokens: null
+notes: >
+  No tools or test feedback. One epoch. Report model generation settings.
+  Upstream uses temperature 0.0; this package leaves sampling to the caller.

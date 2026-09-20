@@ -1,0 +1,4 @@
+apiVersion: v2
+name: cobol-javatrans-sandbox
+version: 1.0.0
+description: AnyEval COBOL-JavaTrans sandbox with standard NetworkPolicy and no sidecars

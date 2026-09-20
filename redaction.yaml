@@ -1,0 +1,6 @@
+version: 1
+redact: [tests, test, result, value, Java_tests, COBOL_canonical_solution, Java_canonical_solution]
+global: [target, targets, answer, explanation]
+sandbox_exec: [input, stdout, stderr]
+# Runtime private_grading suppression protects exporters independently of this policy.
+# The source-language program is intentional task input; the target solution is private.

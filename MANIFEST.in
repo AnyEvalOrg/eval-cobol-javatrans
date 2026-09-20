@@ -1,0 +1,6 @@
+include LICENSE UPSTREAM-LICENSE UPSTREAM-COMMIT NOTICE.md anyeval.json redaction.yaml
+include COBOL-JavaTrans.jsonl
+recursive-include scripts *.py
+recursive-include tests *.py
+recursive-include scaffolds *.yaml
+include run.py bundle.template.json

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://anyeval.com/schema/bundle/1",
+  "bundle_version": 1,
+  "generated_at": null,
+  "eval": {
+    "id": "cobol-javatrans",
+    "task": null,
+    "sample_id": null
+  },
+  "upstream": {
+    "repo": "https://github.com/COBOL-Coder/COBOL-Coder",
+    "inspect_ai": "0.3.260"
+  },
+  "dataset": {
+    "source": "COBOL-JavaTrans",
+    "revision": "2b14b7bf7e55556205654c6f7657fa60e36251fa"
+  },
+  "model": {
+    "name": null,
+    "provider": null,
+    "served": []
+  },
+  "scaffold": {
+    "id": "baseline",
+    "version": 1,
+    "token_limit": null
+  },
+  "sandbox": {
+    "class": null,
+    "provenance": null
+  },
+  "scorer": {
+    "name": "translation_scorer",
+    "metric": "pass@1"
+  },
+  "receipts": [],
+  "routing": [],
+  "outputs": {
+    "status": null,
+    "score": null,
+    "explanation": null
+  }
+}

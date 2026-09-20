@@ -1,0 +1,61 @@
+{
+  "anyeval_version": 1,
+  "eval": {
+    "id": "cobol-javatrans",
+    "slug": "cobol-javatrans",
+    "title": "COBOL-JavaTrans: Bidirectional Program Translation",
+    "group": "Coding",
+    "tags": [
+      "coding",
+      "translation",
+      "cobol",
+      "java",
+      "sandbox",
+      "pass@1"
+    ],
+    "source": "upstream"
+  },
+  "upstream": {
+    "repo": "https://github.com/COBOL-Coder/COBOL-Coder",
+    "path": "evaluation/data/COBOL-JavaTrans.jsonl",
+    "commit": "2b14b7bf7e55556205654c6f7657fa60e36251fa",
+    "inspect_ai": "0.3.260",
+    "eval_version": "1.0.0",
+    "dependency": ""
+  },
+  "execution": {
+    "class": "sandbox-k8s",
+    "cost_class": "medium",
+    "sandbox": "k8s",
+    "requires_internet": false,
+    "fast": false,
+    "supports_k8s": true,
+    "environment": "cobol_javatrans/values.yaml"
+  },
+  "tasks": [
+    {
+      "name": "cobol_to_java",
+      "samples": 143
+    },
+    {
+      "name": "java_to_cobol",
+      "samples": 143
+    }
+  ],
+  "total_samples": 286,
+  "external_assets": [
+    {
+      "type": "container",
+      "source": "us-central1-docker.pkg.dev/openevalz-sbx-84737/openevalz/eval-cobol-sandbox:1.0.0"
+    },
+    {
+      "type": "container",
+      "source": "coredns/coredns:1.8.3",
+      "condition": "Explicit anyeval_chart=false exception only; absent from default chart"
+    }
+  ],
+  "scaffolds": [
+    "baseline"
+  ],
+  "generated": "2026-09-20"
+}
