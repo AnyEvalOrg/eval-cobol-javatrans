@@ -21,14 +21,16 @@ CLEANUP_COMMAND = ["timeout", "-s", "KILL", "5s",
 # pkill exec, verify quiescence with repeated UID sweeps (escaped sessions too).
 # Ignore zombies: they cannot execute and belong to the container's reaper.
 UID_QUIESCENCE = r'''
-import os, subprocess, time
+import os, subprocess, sys, time
+check_only = "--check-only" in sys.argv[1:]
 until = time.monotonic() + 3
 while True:
-    sweep = subprocess.run(["/usr/bin/pkill", "-KILL", "-u", "65532"],
-                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=1)
-    if sweep.returncode not in (0, 1):
-        raise SystemExit(2)
+    if not check_only:
+        sweep = subprocess.run(["/usr/bin/pkill", "-KILL", "-u", "65532"],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=1)
+        if sweep.returncode not in (0, 1):
+            raise SystemExit(2)
     active = False
     for name in os.listdir("/proc"):
         if not name.isdigit():
@@ -42,12 +44,14 @@ while True:
             pass
     if not active:
         break
-    if time.monotonic() >= until:
+    if check_only or time.monotonic() >= until:
         raise SystemExit(2)
     time.sleep(0.02)
 '''
 QUIESCENCE_COMMAND = ["timeout", "-s", "KILL", "5s",
                       "/usr/local/bin/python3", "-I", "-c", UID_QUIESCENCE]
+# Same definition of live processes, without killing an unexpectedly occupied UID.
+QUIESCENCE_CHECK_COMMAND = QUIESCENCE_COMMAND + ["--check-only"]
 
 # Setup runs before any candidate exists. Both execs are bounded by the scorer.
 SETUP = r'''
@@ -95,7 +99,31 @@ key = bytes.fromhex(request.pop("key"))
 limit = request["output_limit"]
 
 
-def restrict_child():
+JAVA_TOOL_OPTIONS = "-Xmx512m -XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSize=64m -Xss1m"
+
+
+def candidate_limits(java=False):
+    # Leave process slots for the root supervisor and independent cleanup execs.
+    # Clamp to inherited budgets as well (the Linux regression uses prlimit).
+    # Native toolchains get 1.5 GiB per process; the 2 GiB pod still bounds the
+    # aggregate. Java needs additional virtual reservations, not resident RAM.
+    memory = 8 * 1024**3 if java else 1536 * 1024**2
+    for kind, value in ((resource.RLIMIT_NPROC, 64),
+                        (resource.RLIMIT_AS, memory),
+                        (resource.RLIMIT_DATA, memory),
+                        (resource.RLIMIT_FSIZE, limit),
+                        (resource.RLIMIT_CORE, 0)):
+        hard = resource.getrlimit(kind)[1]
+        if hard != resource.RLIM_INFINITY:
+            value = min(value, hard)
+        resource.setrlimit(kind, (value, value))
+
+
+def restrict_child(java=False):
+    # Still root in the supervisor's preexec child: set this BEFORE exec/drop so
+    # even immediate allocations and all descendants inherit the OOM preference.
+    with open("/proc/self/oom_score_adj", "w") as f:
+        f.write("1000")
     # No parent-death signal is trusted: the scorer independently kills this UID.
     if libc.prctl(38, 1, 0, 0, 0) != 0:  # PR_SET_NO_NEW_PRIVS
         os._exit(125)
@@ -106,9 +134,7 @@ def restrict_child():
     os.setresuid(CANDIDATE_UID, CANDIDATE_UID, CANDIDATE_UID)
     # Set NPROC AFTER changing UID, avoiding execve's PF_NPROC_EXCEEDED trap.
     # These hard limits and the irreversible credential drop survive exec.
-    resource.setrlimit(resource.RLIMIT_NPROC, (128, 128))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    candidate_limits(java)
 
 
 def kill_group(pgid):
@@ -129,11 +155,21 @@ def sweep_uid():
     # reserved UID and reap adopted descendants, including setsid escapees.
     until = time.monotonic() + 3
     while True:
-        result = subprocess.run(["/usr/bin/pkill", "-KILL", "-u", str(CANDIDATE_UID)],
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, timeout=1)
-        if result.returncode not in (0, 1):
-            raise RuntimeError("UID sweep failed")
+        active = False
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            try:
+                with open("/proc/" + name + "/status") as f:
+                    status = dict(line.split(":", 1) for line in f if ":" in line)
+                if (status["Uid"].split()[0] == str(CANDIDATE_UID)
+                        and status["State"].split()[0] not in {"Z", "X"}):
+                    active = True
+                    os.kill(int(name), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except FileNotFoundError:
+                pass
         while True:
             try:
                 pid, _ = os.waitpid(-1, os.WNOHANG)
@@ -141,7 +177,7 @@ def sweep_uid():
                 break
             if pid == 0:
                 break
-        if result.returncode == 1:
+        if not active:
             return
         if time.monotonic() >= until:
             raise RuntimeError("UID sweep did not complete")
@@ -151,27 +187,55 @@ def sweep_uid():
 def run_step(argv, timeout, candidate_work):
     if not isinstance(argv, list) or not argv or any(not isinstance(x, str) for x in argv):
         raise ValueError("argv must be a nonempty string list")
-    with tempfile.TemporaryFile(dir=work) as stdout, tempfile.TemporaryFile(dir=work) as stderr:
-        child = subprocess.Popen(
-            argv, cwd=candidate_work,
-            env={"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": candidate_work, "TMPDIR": candidate_work},
-            stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, close_fds=True,
-            start_new_session=True, preexec_fn=restrict_child,
-        )
-        timed_out = False
-        try:
-            returncode = child.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-        finally:
-            kill_group(child.pid)
-            returncode = child.wait()
-            sweep_uid()
-        stdout.seek(0)
-        output = stdout.read(limit + 1)
-        overflow = len(output) >= limit or os.fstat(stderr.fileno()).st_size >= limit
-        return dict(returncode=returncode, timeout=timed_out, overflow=overflow), output
+    status = dict(returncode=125, timeout=False, overflow=False,
+                  cleanup_failed=False, supervisor_error=False)
+    output = b""
+    child = None
+    java = os.path.basename(argv[0]) in {"javac", "java"}
+    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": candidate_work, "TMPDIR": candidate_work}
+    if java:
+        env["JAVA_TOOL_OPTIONS"] = JAVA_TOOL_OPTIONS
+    try:
+        with tempfile.TemporaryFile(dir=work) as stdout, tempfile.TemporaryFile(dir=work) as stderr:
+            try:
+                child = subprocess.Popen(
+                    argv, cwd=candidate_work, env=env,
+                    stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, close_fds=True,
+                    start_new_session=True, preexec_fn=lambda: restrict_child(java),
+                )
+                try:
+                    status["returncode"] = child.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    status["timeout"] = True
+            finally:
+                # No cleanup subprocesses: an exhausted PID budget cannot prevent
+                # signing. Independently guard EVERY step so later failures still
+                # yield a receipt, and never run the next stage after failed cleanup.
+                if child is not None:
+                    try:
+                        kill_group(child.pid)
+                    except Exception:
+                        status["cleanup_failed"] = True
+                    try:
+                        status["returncode"] = child.wait(timeout=1)
+                    except Exception:
+                        status["cleanup_failed"] = True
+                    try:
+                        sweep_uid()
+                    except Exception:
+                        status["cleanup_failed"] = True
+            stdout.seek(0)
+            output = stdout.read(limit + 1)
+            status["overflow"] = len(output) >= limit or os.fstat(stderr.fileno()).st_size >= limit
+    except Exception:
+        status["supervisor_error"] = True
+    return status, output
 
+
+status = dict(returncode=125, timeout=False, overflow=False,
+              cleanup_failed=False, supervisor_error=False)
+stage = "compile"
+output = b""
 
 try:
     # Keep launch/request directory root-owned; only its child is writable.
@@ -187,8 +251,8 @@ try:
             f.write(content)
         os.chmod(path, 0o644)
     status, output = run_step(request["argv"], request["timeout"], candidate_work)
-    stage = "compile"
-    if status["returncode"] == 0 and not status["timeout"] and not status["overflow"] and "run_argv" in request:
+    if (status["returncode"] == 0 and not any(status[flag] for flag in
+            ("timeout", "overflow", "cleanup_failed", "supervisor_error")) and "run_argv" in request):
         stage = "run"
         status, output = run_step(request["run_argv"], request["run_timeout"], candidate_work)
         if "output_file" in request and status["returncode"] == 0 and not status["timeout"]:
@@ -207,10 +271,17 @@ try:
             except (OSError, ValueError):
                 status["returncode"] = 125
                 output = b""
+except Exception:
+    # Candidate filesystem changes and post-wait failures must not lose a receipt.
+    status["supervisor_error"] = True
+finally:
     body = json.dumps({**status, "stage": stage,
                       "output": base64.b64encode(output).decode("ascii"), "cwd": work}, separators=(",", ":"))
     tag = hmac.new(key, body.encode(), hashlib.sha256).hexdigest()
     sys.stdout.write(json.dumps({"body": body, "tag": tag}))
-finally:
-    shutil.rmtree(work, ignore_errors=True)
+    sys.stdout.flush()  # Publish BEFORE any optional directory cleanup.
+    try:
+        shutil.rmtree(work, ignore_errors=True)
+    except Exception:
+        pass  # Receipt is already committed; sandbox teardown removes leftovers.
 '''

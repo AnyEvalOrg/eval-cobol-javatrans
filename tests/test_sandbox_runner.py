@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 import pytest
 from cobol_javatrans.sandbox_runner import SETUP, RUNNER, CLEANUP_COMMAND, QUIESCENCE_COMMAND
 from cobol_javatrans.scoring import verify_receipt
@@ -20,7 +21,7 @@ def prepare(request):
 
 
 def run_fixture(compile_code='pass', run_code="print('ok')", timeout=1, output_file=None,
-                real_supervisor=False):
+                real_supervisor=False, transform=None):
     request = dict(files={'fixture.txt': 'safe authored input'}, argv=[sys.executable, '-I', '-c', compile_code],
                    run_argv=[sys.executable, '-I', '-c', run_code], timeout=timeout, run_timeout=timeout, output_limit=4096)
     if output_file:
@@ -32,6 +33,9 @@ def run_fixture(compile_code='pass', run_code="print('ok')", timeout=1, output_f
         # Keep file-size limits, overflow detection, and stage gating intact.
         source = source.replace('libc = ctypes.CDLL(None, use_errno=True)', 'libc = type("Stub", (), {"prctl": lambda *args: 0})()')
         source = source.replace('os.getuid() != 0', 'False')
+        source = source.replace('with open("/proc/self/oom_score_adj", "w") as f:', 'with open(os.devnull, "w") as f:')
+        source = source.replace('    candidate_limits(java)',
+                                '    resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))')
         source = source.replace('os.setgroups([])', 'pass')
         source = source.replace('os.setresgid(CANDIDATE_GID, CANDIDATE_GID, CANDIDATE_GID)', 'pass')
         source = source.replace('os.setresuid(CANDIDATE_UID, CANDIDATE_UID, CANDIDATE_UID)', 'pass')
@@ -40,13 +44,18 @@ def run_fixture(compile_code='pass', run_code="print('ok')", timeout=1, output_f
         source = source.replace('os.killpg(pgid, sig)', 'os.kill(pgid, sig)')
         start, end = source.index('def sweep_uid():'), source.index('def run_step(')
         source = source[:start] + 'def sweep_uid():\n    pass\n\n\n' + source[end:]
+    if transform:
+        source = transform(source)
     try:
-        result = subprocess.run([sys.executable, '-I', '-c', source, setup['cwd']],
-                                capture_output=True, text=True, timeout=8)
-        assert result.returncode == 0, result.stderr
-        receipt = verify_receipt(result.stdout, bytes.fromhex(setup['key']))
+        with tempfile.TemporaryFile() as published:
+            result = subprocess.run([sys.executable, '-I', '-c', source, setup['cwd']],
+                                    stdout=published, stderr=subprocess.PIPE, text=True, timeout=8)
+            assert result.returncode == 0, result.stderr
+            published.seek(0)
+            receipt = verify_receipt(published.read().decode(), bytes.fromhex(setup['key']))
         assert receipt is not None
-        assert not Path(setup['cwd']).exists()
+        if not transform:
+            assert not Path(setup['cwd']).exists()
         return receipt
     finally:
         shutil.rmtree(setup['cwd'], ignore_errors=True)
@@ -136,6 +145,68 @@ def test_compile_failure_never_executes_run_step():
     assert 'MUST_NOT_RUN' not in receipt['output']
 
 
+def test_compile_only_success_retains_compile_stage():
+    receipt = run_fixture(transform=lambda source: source.replace(
+        'key = bytes.fromhex', "request.pop('run_argv')\nkey = bytes.fromhex"))
+    assert receipt['stage'] == 'compile' and receipt['returncode'] == 0
+    from cobol_javatrans.receipt import receipt_failure
+    assert receipt_failure(receipt) == 'run did not complete.'
+
+
+@pytest.mark.parametrize('state,uid,expected', [
+    ('Z', '65532', 0), ('X', '65532', 0), ('S', '65532', 2),
+    ('R', '65532', 2), ('S', '0', 0),
+])
+def test_quiescence_preflight_ignores_only_dead_or_other_uid(monkeypatch, state, uid, expected):
+    import io
+    from cobol_javatrans.sandbox_runner import UID_QUIESCENCE, QUIESCENCE_CHECK_COMMAND
+    monkeypatch.setattr(sys, 'argv', ['-c', '--check-only'])
+    monkeypatch.setattr(os, 'listdir', lambda path: ['self', '123', '456'])
+
+    def read_status(path):
+        if path == '/proc/456/status':
+            raise FileNotFoundError  # Process exited between enumeration and read.
+        assert path == '/proc/123/status'
+        return io.StringIO(f'Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nState:\t{state} (fixture)\n')
+
+    def forbidden_sweep(*args, **kwargs):
+        pytest.fail('preflight must not kill any processes')
+
+    monkeypatch.setattr('builtins.open', read_status)
+    monkeypatch.setattr(subprocess, 'run', forbidden_sweep)
+    assert QUIESCENCE_CHECK_COMMAND == QUIESCENCE_COMMAND + ['--check-only']
+    if expected:
+        with pytest.raises(SystemExit) as stopped:
+            exec(UID_QUIESCENCE, {})
+        assert stopped.value.code == expected
+    else:
+        exec(UID_QUIESCENCE, {})
+
+
+def test_quiescence_repeats_sweeps_until_only_zombies_remain(monkeypatch):
+    import io
+    import time
+    from types import SimpleNamespace
+    from cobol_javatrans.sandbox_runner import UID_QUIESCENCE
+    sweeps = []
+    monkeypatch.setattr(sys, 'argv', ['-c'])
+    monkeypatch.setattr(os, 'listdir', lambda path: ['123'])
+    monkeypatch.setattr(time, 'sleep', lambda delay: None)
+
+    def sweep(command, **kwargs):
+        sweeps.append(command)
+        return SimpleNamespace(returncode=0)
+
+    def read_status(path):
+        state = 'S' if len(sweeps) == 1 else 'Z'
+        return io.StringIO(f'Uid:\t65532\t65532\t65532\t65532\nState:\t{state}\n')
+
+    monkeypatch.setattr(subprocess, 'run', sweep)
+    monkeypatch.setattr('builtins.open', read_status)
+    exec(UID_QUIESCENCE, {})
+    assert sweeps == [['/usr/bin/pkill', '-KILL', '-u', '65532']] * 2
+
+
 def test_forged_marker_cannot_override_exit():
     receipt = run_fixture(run_code="print('<completed-sentinel-value-0>'); raise SystemExit(7)")
     assert receipt['stage'] == 'run' and receipt['returncode'] == 7
@@ -164,8 +235,113 @@ def test_supervisor_preserves_required_security_contract():
     tree = ast.parse(RUNNER)
     restrict = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'restrict_child')
     calls = [ast.unparse(n.value) for n in restrict.body if isinstance(n, ast.Expr)]
-    assert calls.index('os.setgroups([])') < calls.index('os.setresgid(CANDIDATE_GID, CANDIDATE_GID, CANDIDATE_GID)') < calls.index('os.setresuid(CANDIDATE_UID, CANDIDATE_UID, CANDIDATE_UID)') < calls.index('resource.setrlimit(resource.RLIMIT_NPROC, (128, 128))')
-    for text in ['libc.prctl(4, 0, 0, 0, 0)', 'libc.prctl(38, 1, 0, 0, 0)', 'libc.prctl(8, 0, 0, 0, 0)', 'libc.prctl(36, 1, 0, 0, 0)', 'os.killpg(pgid, sig)', 'os.O_NOFOLLOW', 'sweep_uid()', 'close_fds=True', 'start_new_session=True', 'preexec_fn=restrict_child', 'os.unlink(request_path)']:
+    assert calls.index('os.setgroups([])') < calls.index('os.setresgid(CANDIDATE_GID, CANDIDATE_GID, CANDIDATE_GID)') < calls.index('os.setresuid(CANDIDATE_UID, CANDIDATE_UID, CANDIDATE_UID)') < calls.index('candidate_limits(java)')
+    for text in ['libc.prctl(4, 0, 0, 0, 0)', 'libc.prctl(38, 1, 0, 0, 0)', 'libc.prctl(8, 0, 0, 0, 0)', 'libc.prctl(36, 1, 0, 0, 0)', 'os.killpg(pgid, sig)', 'os.O_NOFOLLOW', 'sweep_uid()', 'close_fds=True', 'start_new_session=True', 'preexec_fn=lambda: restrict_child(java)', 'os.unlink(request_path)']:
         assert text in RUNNER
     assert 'shell=True' not in RUNNER and 'bash' not in RUNNER
     assert CLEANUP_COMMAND[-4:] == ['/usr/bin/pkill', '-KILL', '-u', '65532']
+
+
+@pytest.mark.parametrize('output_file', [None, 'OUT.TXT'])
+def test_invalid_utf8_retains_authenticated_receipt(output_file):
+    code = "import os; os.write(1, bytes([255])); raise SystemExit(1)"
+    if output_file:
+        code = "open('OUT.TXT', 'wb').write(bytes([255]))"
+    receipt = run_fixture(run_code=code, output_file=output_file)
+    assert receipt['stage'] == 'run'
+    assert receipt['output_not_decodable'] is True
+    from cobol_javatrans.receipt import receipt_failure
+    assert receipt_failure(receipt) == 'output not decodable.'
+
+
+@pytest.mark.parametrize('failed_step', ['kill_group', 'sweep_uid', 'read', 'rmtree'])
+def test_post_exit_exceptions_cannot_erase_receipt(failed_step):
+    def transform(source):
+        if failed_step == 'rmtree':
+            # Simulate cleanup trying to spawn with no slots. At that instant,
+            # the actual stdout fd must already contain a signed, flushed receipt.
+            source = source.replace('    try:\n        shutil.rmtree', '''    def failed_spawn(*args, **kwargs):
+        try:
+            published = json.loads(os.pread(1, 65536, 0))
+            assert hmac.compare_digest(published["tag"],
+                hmac.new(key, published["body"].encode(), hashlib.sha256).hexdigest())
+        except Exception:
+            raise SystemExit(99)
+        raise OSError("no process slots")
+    subprocess.run = failed_spawn
+    try:
+        subprocess.run(["cleanup"])
+        shutil.rmtree''')
+        elif failed_step == 'read':
+            source = source.replace('output = stdout.read(limit + 1)', 'raise OSError("read failed")')
+        else:
+            name = 'def ' + failed_step + '('
+            start = source.index(name)
+            body = source.index('\n', start) + 1
+            source = source[:body] + '    raise OSError("no process slots")\n' + source[body:]
+        return source
+    receipt = run_fixture(compile_code='raise SystemExit(7)', transform=transform)
+    assert receipt['returncode'] == 7
+    assert receipt['stage'] == 'compile'
+    if failed_step in {'kill_group', 'sweep_uid'}:
+        assert receipt['cleanup_failed']
+    if failed_step == 'read':
+        assert receipt['supervisor_error']
+
+
+@pytest.mark.parametrize('java', [False, True])
+@pytest.mark.parametrize('inherited', [None, 384 * 1024**2])
+def test_actual_candidate_limits_function(java, inherited):
+    from types import SimpleNamespace
+    import resource
+    limits = {}
+    fake = SimpleNamespace(**{name: getattr(resource, name) for name in
+        ('RLIMIT_NPROC', 'RLIMIT_AS', 'RLIMIT_DATA', 'RLIMIT_FSIZE', 'RLIMIT_CORE', 'RLIM_INFINITY')})
+    fake.getrlimit = lambda kind: (inherited, inherited) if inherited and kind in (resource.RLIMIT_AS, resource.RLIMIT_DATA) else (resource.RLIM_INFINITY, resource.RLIM_INFINITY)
+    fake.setrlimit = lambda kind, values: limits.__setitem__(kind, values)
+    tree = ast.parse(RUNNER)
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'candidate_limits')
+    ns = {'resource': fake, 'limit': 4096}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), '<limits>', 'exec'), ns)
+    ns['candidate_limits'](java)
+    memory = inherited or (8 * 1024**3 if java else 1536 * 1024**2)
+    assert limits == {resource.RLIMIT_NPROC: (64, 64), resource.RLIMIT_AS: (memory, memory),
+                      resource.RLIMIT_DATA: (memory, memory), resource.RLIMIT_FSIZE: (4096, 4096),
+                      resource.RLIMIT_CORE: (0, 0)}
+
+
+def test_oom_preference_is_set_as_root_before_credential_drop():
+    tree = ast.parse(RUNNER)
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'restrict_child')
+    source = ast.unparse(fn)
+    assert source.index("open('/proc/self/oom_score_adj', 'w')") < source.index('os.setresuid(')
+    assert "f.write('1000')" in source
+
+
+@pytest.mark.parametrize('executable,java', [('javac', True), ('java', True), ('cobc', False), ('./call', False)])
+def test_step_applies_jvm_environment_and_matching_preexec_limits(tmp_path, executable, java):
+    from types import SimpleNamespace
+    calls = []
+    modes = []
+
+    def popen(argv, **kwargs):
+        calls.append((argv, kwargs))
+        kwargs['preexec_fn']()
+        return SimpleNamespace(pid=123, wait=lambda **kwargs: 0)
+
+    tree = ast.parse(RUNNER)
+    nodes = [n for n in tree.body if
+             (isinstance(n, ast.FunctionDef) and n.name == 'run_step') or
+             (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'JAVA_TOOL_OPTIONS' for t in n.targets))]
+    ns = dict(os=os, tempfile=tempfile, work=str(tmp_path), limit=4096,
+              subprocess=SimpleNamespace(Popen=popen, DEVNULL=subprocess.DEVNULL, TimeoutExpired=subprocess.TimeoutExpired),
+              restrict_child=modes.append, kill_group=lambda pid: None, sweep_uid=lambda: None)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), '<step>', 'exec'), ns)
+    status, _ = ns['run_step']([executable], 1, str(tmp_path))
+    assert status['returncode'] == 0 and not status['supervisor_error']
+    assert modes == [java]
+    env = calls[0][1]['env']
+    if java:
+        assert env['JAVA_TOOL_OPTIONS'] == '-Xmx512m -XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSize=64m -Xss1m'
+    else:
+        assert 'JAVA_TOOL_OPTIONS' not in env

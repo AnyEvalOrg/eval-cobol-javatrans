@@ -55,7 +55,8 @@ For each COBOL test, the scorer starts a fresh directory containing `call.cbl` a
 `solution.cbl`, invokes `["cobc", "-w", "-fformat=variable", "-x", "call.cbl",
 "solution.cbl"]`, then `["./call"]`. It reads the output file named
 `entry_point.upper().replace("_", "-") + ".TXT"`. A missing/unsafe output file,
-compile error, runtime error, timeout, overflow, or wrong result is incorrect.
+compile error, runtime error, timeout, overflow, undecodable output, or wrong result
+is incorrect.
 All callers must pass; the scorer stops at the first failure.
 
 The upstream `parse` and `is_equal` functions are copied faithfully:
@@ -96,9 +97,24 @@ file descriptors. Both launches use argv lists, never `bash -c` or `shell=True`.
 
 **Required change from the Python template:** its `RLIMIT_NPROC=0` would prevent
 GnuCOBOL from invoking the C toolchain and the JVM from creating threads. Here the
-hard process/thread limit is **128**. Each step ends with TERM/KILL of its process
-group and repeated reserved-UID sweeps. The supervisor acts as a Linux subreaper
-and reaps adopted descendants, including those that changed sessions.
+hard process/thread limit is **64**, below the container's 128 PID slots, leaving
+room for the supervisor and independent cleanup. Each step ends with TERM/KILL of
+its process group and repeated reserved-UID sweeps using `/proc` and `os.kill`,
+without spawning cleanup processes. The supervisor acts as a Linux subreaper and
+reaps adopted descendants, including those that changed sessions. Post-run errors
+produce signed failure flags, and failed cleanup blocks the next stage. The receipt
+is flushed before optional directory removal, whose exceptions cannot erase it.
+
+Native compiler/runtime children have hard **1.5 GiB RLIMIT_AS and RLIMIT_DATA**
+limits. Java steps use **8 GiB** virtual address/data limits to accommodate JVM
+reservations and `JAVA_TOOL_OPTIONS="-Xmx512m -XX:MaxMetaspaceSize=256m
+-XX:ReservedCodeCacheSize=64m -Xss1m"`. These limits are clamped to any tighter
+inherited hard limits. The root preexec child writes `1000` to its
+`/proc/self/oom_score_adj` before dropping credentials; descendants inherit the
+OOM preference. Core dumps remain disabled and RLIMIT_FSIZE remains 1 MiB.
+The 2 GiB pod budget leaves 512 MiB beyond a single native process's allocation
+limit and also caps aggregate usage across compiler subprocesses. JVM steps have
+bounded heap/metaspace/code cache within the same pod budget.
 
 The host always performs the template's separate bounded
 `/usr/bin/pkill -KILL -u 65532` cleanup exec, even after setup failures, lost or
@@ -129,7 +145,12 @@ or setup/supervisor exec timeout or output limit) is a harness failure: the scor
 raises `RuntimeError("Private sandbox operation failed; details withheld.")`.
 Inspect records a sample error and AnyEval refuses to publish the run, so it does
 not enter the published pass rate. Candidate failures reported in authenticated
-receipts, including timeouts and output overflow, remain incorrect verdicts.
+receipts, including timeouts, output overflow, post-run/cleanup failures, and
+undecodable output, remain incorrect verdicts. Raw candidate bytes are base64
+encoded before signing. The verifier authenticates the envelope and strictly
+validates supervisor-owned fields first; malformed base64, output shape, or UTF-8
+then becomes authenticated `output not decodable`, never a missing receipt.
+This also applies to Java stdout even though valid Java stdout is not compared.
 
 `publication.py` preserves the template's private Inspect event proxy and
 context-local provider log filtering. Private sandbox calls produce no transcript
@@ -169,6 +190,8 @@ is **`app.kubernetes.io/instance: <release>`**, never the entire namespace. Both
 ingress and egress, including DNS, are denied. The Pod uses gVisor, GKE Spot, no
 service-account token, no host networking/mounts, no sidecars, and restartPolicy
 Never. Requests equal limits: **1 CPU, 2 GiB memory, 1 GiB ephemeral storage**.
+Equal CPU/memory reservations provide Guaranteed QoS and reserve the supervisor's
+memory headroom; `values.yaml` documents the candidate memory budgets.
 Autopilot supplies the Spot toleration; the chart adds none. The task defaults
 `INSPECT_K8S_DEFAULT_NAMESPACE` to `anyeval-sandbox` without overriding an existing
 setting. Trusted execs run as root with only SETUID, SETGID, KILL, CHOWN, and
@@ -205,12 +228,46 @@ against the supplied source, deterministic rebuilding, field-taint privacy,
 comparison edge cases, fake-sandbox failures/cancellation/cleanup, authenticated
 supervisor mechanics using authored fixtures, actual Helm rendering/strict lint,
 and rejection of deliberately broken chart templates. Local supervisor fixtures
-stub Linux credentials, prctl, and UID sweeping; they are **not Linux containment
+stub Linux credentials, prctl, memory/process limits, OOM preference, and UID sweeping; they are **not Linux containment
 attestation**. Full JVM/GnuCOBOL execution and Linux isolation need the image.
 Two opt-in Linux regressions are skipped unless running as root in a disposable
 sandbox with an unused UID 65532 and `CJT_LINUX_CONTAINMENT=1`. They check actual
 credentials/capabilities, protected supervisor memory/signals, detached descendant
 cleanup, and independent cleanup after forcibly killing the supervisor.
+
+The standalone `scripts/linux_regressions.py` runs the actual SETUP + RUNNER and
+shared receipt verifier as root inside the reference image, with no Inspect
+installation. It first checks real `javac`/`java` and `cobc`/COBOL startup under the
+limits, then checks invalid UTF-8, detached children exhausting their fork budget,
+and unbounded memory allocation. Each attack must produce an authenticated
+INCORRECT outcome; success logs contain only stage, returncode, and boolean flags.
+Regression failures additionally name the check (`step`, such as
+`compiler_smoke:cobc`), exception class (`error`), and an allowlisted assertion
+`label` when applicable. Exception text, candidate output, and keys are never
+printed. The pre-setup UID check uses the cleanup sweep's live-process definition
+(ignoring zombies) without killing processes. Both compiler smokes require a
+`run` receipt; a successful compile-only receipt does not pass them.
+When Docker is available, the memory case runs in a fresh `docker run
+--memory=512m --memory-swap=512m --pids-limit=128` and must survive a candidate OOM
+kill with an authenticated receipt. Without Docker, a real `prlimit` AS/DATA
+budget of 512 MiB checks allocation failure and receipt survival; this fallback
+does **not** attest cgroup OOM behavior. Docker availability with a broken daemon
+is a failure, not a fallback. The checkout must be mounted at the same absolute
+path on the Docker daemon host and in the script's container.
+
+Operators can run the full Docker regression via Cloud Build (substitute the
+reference image digest). The supplied build uses the Docker builder's client and
+socket, a disposable 2 GiB/128 PID outer container, and the 512 MiB inner container:
+
+```bash
+gcloud builds submit . --config scripts/cloudbuild-linux-regressions.yaml \
+  --substitutions=_IMAGE=REGISTRY/IMAGE@sha256:DIGEST
+# Without Docker, inside a disposable reference image with this checkout mounted:
+python3 scripts/linux_regressions.py
+```
+
+These Linux/operator checks are separate from the default host unit suite and
+must be run before treating the resource limits as reference-image validation.
 
 ```bash
 python -m pytest -q

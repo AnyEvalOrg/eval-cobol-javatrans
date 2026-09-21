@@ -1,0 +1,21 @@
+# Operator-run regression against the reference image (pin _IMAGE to a digest).
+# The image needs only its existing Python/compiler/runtime packages, not Inspect.
+substitutions:
+  _IMAGE: us-central1-docker.pkg.dev/openevalz-sbx-84737/openevalz/eval-cobol-sandbox:1.0.0
+steps:
+  - name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        mkdir -p /workspace/.linux-regressions
+        cp "$$(command -v docker)" /workspace/.linux-regressions/docker
+        docker pull '${_IMAGE}'
+        docker run --rm --init --network=none --memory=2g --memory-swap=2g --pids-limit=128 --cpus=1 \
+          --cap-drop=ALL --cap-add=SETUID --cap-add=SETGID --cap-add=KILL \
+          --cap-add=CHOWN --cap-add=DAC_OVERRIDE --security-opt=no-new-privileges --user=0:0 \
+          -v /workspace:/workspace:ro -v /var/run/docker.sock:/var/run/docker.sock \
+          -e DOCKER_HOST=unix:///var/run/docker.sock --entrypoint /usr/local/bin/python3 \
+          '${_IMAGE}' /workspace/scripts/linux_regressions.py \
+          --docker-cli /workspace/.linux-regressions/docker --image '${_IMAGE}'
+timeout: 600s

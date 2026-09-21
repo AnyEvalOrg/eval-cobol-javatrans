@@ -44,7 +44,9 @@ def signed_receipt(key, cwd, output="2", **kwargs):
     body = json.dumps(dict(returncode=kwargs.get("returncode", 0),
                            timeout=kwargs.get("timeout", False),
                            overflow=kwargs.get("overflow", False), stage=kwargs.get("stage", "run"), cwd=cwd,
-                           output=base64.b64encode(output.encode()).decode()))
+                           cleanup_failed=kwargs.get("cleanup_failed", False),
+                           supervisor_error=kwargs.get("supervisor_error", False),
+                           output=base64.b64encode(output if isinstance(output, bytes) else output.encode()).decode()))
     return json.dumps({"body": body, "tag": hmac.new(key, body.encode(), hashlib.sha256).hexdigest()})
 
 
@@ -406,3 +408,50 @@ def test_receipt_rejection_is_an_inspect_sample_error_without_a_score(monkeypatc
     assert not any(event.event == 'score' for event in sample.events)
     assert 'PRIVATE_' not in sample.error.model_dump_json()
     assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+
+
+@pytest.mark.parametrize('kind', ['cobol_to_java', 'java_to_cobol'])
+@pytest.mark.parametrize('output', [b'\xff', None, [], {}, 12, 'invalid base64'])
+def test_authenticated_invalid_output_is_incorrect(monkeypatch, kind, output):
+    import hashlib
+    import hmac
+    key = bytes(range(32))
+    envelope = json.loads(signed_receipt(key, '/tmp/cjt-fresh_1', output=b'\xff'))
+    if output != b'\xff':
+        body = json.loads(envelope['body'])
+        body['output'] = output
+        envelope['body'] = json.dumps(body)
+        envelope['tag'] = hmac.new(key, envelope['body'].encode(), hashlib.sha256).hexdigest()
+    response = json.dumps(envelope)
+    assert scoring.verify_receipt(response, key)['output_not_decodable']
+    assert scoring.verify_receipt(response, b'wrong key') is None
+    fake = FakeSandbox([response])
+    install_sandbox(monkeypatch, fake)
+    score = asyncio.run(scoring.translation_scorer(kind)(state(kind), Target('')))
+    assert score.value == INCORRECT
+    assert score.explanation == 'Test 1: output not decodable.'
+    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+
+
+@pytest.mark.parametrize('flag', ['cleanup_failed', 'supervisor_error'])
+def test_authenticated_post_run_failure_is_incorrect_with_independent_cleanup(monkeypatch, flag):
+    fake = FakeSandbox([signed_receipt(bytes(range(32)), '/tmp/cjt-fresh_1', **{flag: True})])
+    install_sandbox(monkeypatch, fake)
+    score = asyncio.run(scoring.translation_scorer('cobol_to_java')(state('cobol_to_java'), Target('')))
+    assert score.value == INCORRECT
+    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+
+
+@pytest.mark.parametrize('field,value', [('stage', []), ('stage', 'unknown'), ('returncode', True),
+    ('timeout', 1), ('overflow', 'false'), ('cwd', None), ('cwd', '/tmp/other'),
+    ('cleanup_failed', 1), ('supervisor_error', [])])
+def test_authenticated_control_fields_stay_strict(field, value):
+    import hashlib
+    import hmac
+    key = bytes(range(32))
+    envelope = json.loads(signed_receipt(key, '/tmp/cjt-fresh_1'))
+    body = json.loads(envelope['body'])
+    body[field] = value
+    envelope['body'] = json.dumps(body)
+    envelope['tag'] = hmac.new(key, envelope['body'].encode(), hashlib.sha256).hexdigest()
+    assert scoring.verify_receipt(json.dumps(envelope), key) is None

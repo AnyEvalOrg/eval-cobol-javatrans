@@ -28,6 +28,13 @@ services:
         add: ["SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE"]
       seccompProfile:
         type: RuntimeDefault
+    # Equal CPU/memory requests and limits give Guaranteed QoS and reserve the
+    # full 2 GiB, avoiding memory overcommit onto the supervisor's node budget.
+    # Native candidate AS/DATA are capped at 1.5 GiB per process. JVM heap,
+    # metaspace/code cache are 512/256/64 MiB (8 GiB AS for virtual reservations).
+    # A single native process leaves 512 MiB for the supervisor/cleanup; the pod
+    # limit also bounds aggregate usage across compiler subprocesses. All
+    # candidates inherit oom_score_adj=1000 to prefer them under residual pressure.
     resources:
       requests:
         cpu: "1"
