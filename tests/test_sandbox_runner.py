@@ -14,8 +14,11 @@ from cobol_javatrans.sandbox_runner import SETUP, RUNNER, CLEANUP_COMMAND, QUIES
 from cobol_javatrans.scoring import verify_receipt
 
 
-def prepare(request):
-    result = subprocess.run([sys.executable, '-I', '-c', SETUP], input=json.dumps(request),
+def prepare(request, real_supervisor=False):
+    # Host protocol fixtures explicitly bypass Linux prerequisites; dedicated
+    # monkeypatched tests below exercise the real setup probe and failure path.
+    source = SETUP if real_supervisor else SETUP.replace('    check_prerequisites(work)', '    pass')
+    result = subprocess.run([sys.executable, '-I', '-c', source], input=json.dumps(request),
                             capture_output=True, text=True, timeout=5)
     assert result.returncode == 0
     return json.loads(result.stdout)
@@ -27,7 +30,7 @@ def run_fixture(compile_code='pass', run_code="print('ok')", timeout=1, output_f
                    run_argv=[sys.executable, '-I', '-c', run_code], timeout=timeout, run_timeout=timeout, output_limit=4096)
     if output_file:
         request['output_file'] = output_file
-    setup = prepare(request)
+    setup = prepare(request, real_supervisor=real_supervisor)
     source = RUNNER
     if not real_supervisor:
         # Never perform credential changes or UID sweeps on the developer host.
@@ -282,7 +285,7 @@ def test_actual_candidate_limits_function(java, inherited):
     import resource
     limits = {}
     fake = SimpleNamespace(**{name: getattr(resource, name) for name in
-        ('RLIMIT_NPROC', 'RLIMIT_AS', 'RLIMIT_DATA', 'RLIMIT_FSIZE', 'RLIMIT_CORE', 'RLIM_INFINITY')})
+        ('RLIMIT_NPROC', 'RLIMIT_NOFILE', 'RLIMIT_AS', 'RLIMIT_DATA', 'RLIMIT_FSIZE', 'RLIMIT_CORE', 'RLIM_INFINITY')})
     fake.getrlimit = lambda kind: (inherited, inherited) if inherited and kind in (resource.RLIMIT_AS, resource.RLIMIT_DATA) else (resource.RLIM_INFINITY, resource.RLIM_INFINITY)
     fake.setrlimit = lambda kind, values: limits.__setitem__(kind, values)
     tree = ast.parse(RUNNER)
@@ -293,7 +296,8 @@ def test_actual_candidate_limits_function(java, inherited):
     memory = inherited or (8 * 1024**3 if java else 1024**3)
     assert limits == {resource.RLIMIT_NPROC: (64, 64), resource.RLIMIT_AS: (memory, memory),
                       resource.RLIMIT_DATA: (memory, memory), resource.RLIMIT_FSIZE: (4096, 4096),
-                      resource.RLIMIT_CORE: (0, 0)}
+                      resource.RLIMIT_CORE: (0, 0),
+                      resource.RLIMIT_NOFILE: (1024, 1024) if java else (256, 256)}
 
 
 def test_oom_preference_is_set_as_root_before_credential_drop():
@@ -328,7 +332,7 @@ def test_step_applies_jvm_environment_and_matching_preexec_limits(tmp_path, exec
     assert modes == [java]
     env = calls[0][1]['env']
     if java:
-        assert env['JAVA_TOOL_OPTIONS'] == '-Xmx512m -XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSize=64m -Xss1m'
+        assert env['JAVA_TOOL_OPTIONS'] == '-Xmx512m -XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSize=64m -Xss1m -XX:-UsePerfData'
     else:
         assert 'JAVA_TOOL_OPTIONS' not in env
 
@@ -437,17 +441,18 @@ def test_disk_watchdog_counts_allocated_blocks_across_trees(tmp_path, trips):
             assert interval == 0.1
             self.done = True
     ns = dict(os=os, stat=stat, errno=errno, signal=signal,
-              AGGREGATE_DISK=expected - int(trips), DISK_WATCHDOG_INTERVAL=0.1,
-              candidate_processes=lambda: [(124, 0)])
+              AGGREGATE_DISK=expected - int(trips), DISK_ENTRY_LIMIT=10000, DISK_WATCHDOG_INTERVAL=0.1,
+              candidate_processes=lambda: [])
     exec(compile(ast.Module(body=nodes, type_ignores=[]), '<disk-watchdog>', 'exec'), ns)
     usage = ns['disk_usage']
     assert usage(roots) == expected
     assert usage([tmp_path / 'missing', work / 'data', sibling / 'dir-link']) == 0
-    ns['disk_usage'] = lambda: usage(roots)
-    # Exercise the shared kill path, without signaling any real processes.
+    ns['disk_usage'] = lambda **kwargs: usage(roots, **kwargs)
+    # Exercise the shared kill path, without scanning/signaling host processes.
+    ns['kill_candidate'] = partial(ns['kill_candidate'], processes=[(124, 0)])
     from types import SimpleNamespace
     ns['os'] = SimpleNamespace(**{name: getattr(os, name) for name in
-        ('open', 'close', 'scandir', 'O_RDONLY', 'O_DIRECTORY', 'O_NOFOLLOW')},
+        ('open', 'close', 'scandir', 'stat', 'O_RDONLY', 'O_DIRECTORY', 'O_NOFOLLOW')},
         killpg=lambda *args: calls.append(('group', *args)),
         kill=lambda *args: calls.append(('pid', *args)))
     status = dict(disk_exceeded=False, supervisor_error=False)
@@ -460,7 +465,7 @@ def test_disk_watchdog_fails_closed_on_scan_error():
     from types import SimpleNamespace
     nodes = [n for n in ast.parse(RUNNER).body if isinstance(n, ast.FunctionDef)
              and n.name == 'disk_watchdog']
-    def broken_scan():
+    def broken_scan(**kwargs):
         raise PermissionError('scan failed')
     killed = []
     ns = dict(disk_usage=broken_scan, kill_candidate=killed.append)
@@ -497,7 +502,396 @@ def test_disk_walk_tolerates_directory_replacement_without_following(tmp_path, r
         ('close', 'scandir', 'O_RDONLY', 'O_DIRECTORY', 'O_NOFOLLOW')}, open=racing_open)
     node = next(n for n in ast.parse(RUNNER).body if isinstance(n, ast.FunctionDef)
                 and n.name == 'disk_usage')
-    ns = dict(os=fake_os, stat=stat, errno=errno)
+    ns = dict(os=fake_os, stat=stat, errno=errno, AGGREGATE_DISK=256 * 1024**2,
+              DISK_ENTRY_LIMIT=10000, candidate_processes=lambda: [])
     exec(compile(ast.Module(body=[node], type_ignores=[]), '<disk-race>', 'exec'), ns)
     assert ns['disk_usage']([root]) == stable.stat().st_blocks * 512
     assert opened == ['moving']
+
+
+def disk_namespace(**overrides):
+    import errno
+    import stat
+    ns = dict(os=os, stat=stat, errno=errno, AGGREGATE_DISK=256 * 1024**2,
+              DISK_ENTRY_LIMIT=10000, candidate_processes=lambda: [])
+    ns.update(overrides)
+    node = next(n for n in ast.parse(RUNNER).body if isinstance(n, ast.FunctionDef)
+                and n.name == 'disk_usage')
+    exec(compile(ast.Module(body=[node], type_ignores=[]), '<disk-usage>', 'exec'), ns)
+    return ns
+
+
+def test_disk_counts_unlinked_and_memfd_descriptors_once(tmp_path):
+    import stat
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    visible = tmp_path / 'visible'
+    visible.write_bytes(os.urandom(8192))
+    (tmp_path / 'hardlink').hardlink_to(visible)
+    with tempfile.TemporaryFile(dir=tmp_path) as retained:
+        retained.write(os.urandom(16384))
+        retained.flush()
+        # Procfs magic-link stat results, including an anonymous memfd and a
+        # pipe that must be ignored. Repeated fds across processes count once.
+        memfd = SimpleNamespace(st_mode=stat.S_IFREG, st_blocks=32, st_dev=777, st_ino=9)
+        infos = {'0': visible.stat(), '1': os.fstat(retained.fileno()), '2': memfd,
+                 '3': memfd, '4': SimpleNamespace(st_mode=stat.S_IFIFO, st_dev=778, st_ino=1)}
+        real_scandir = os.scandir
+        paths = []
+        def scandir(path):
+            if isinstance(path, str) and path.startswith('/proc/'):
+                return nullcontext(iter(SimpleNamespace(path=path + '/' + name)
+                                        for name in [*infos, 'closed']))
+            return real_scandir(path)
+        def proc_stat(path):
+            paths.append(path)
+            if path.endswith('/closed'):
+                raise FileNotFoundError(2, 'descriptor closed')
+            return infos[path.rsplit('/', 1)[-1]]
+        fake_os = SimpleNamespace(**{name: getattr(os, name) for name in
+            ('open', 'close', 'O_RDONLY', 'O_DIRECTORY', 'O_NOFOLLOW')},
+            scandir=scandir, stat=proc_stat)
+        ns = disk_namespace(os=fake_os, candidate_processes=lambda: [(2, 0), (3, 0)])
+        expected = sum(info.st_blocks * 512 for info in (infos['0'], infos['1'], memfd))
+        assert ns['disk_usage']([tmp_path]) == expected
+        assert len(paths) == 12
+
+
+@pytest.mark.parametrize('stop_after', [0, 17, None])
+def test_disk_scan_cancels_and_stops_at_inode_budget(stop_after):
+    import stat
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    visited = []
+    def entries():
+        for i in range(50000):
+            visited.append(i)
+            yield SimpleNamespace(stat=lambda **kw: SimpleNamespace(
+                st_mode=stat.S_IFREG, st_dev=1, st_ino=i, st_blocks=0))
+    fake_os = SimpleNamespace(O_RDONLY=0, O_DIRECTORY=0, O_NOFOLLOW=0,
+                              open=lambda *a, **kw: 1, close=lambda fd: None,
+                              scandir=lambda fd: nullcontext(entries()))
+    stopped = SimpleNamespace(is_set=lambda: stop_after is not None and len(visited) >= stop_after)
+    ns = disk_namespace(os=fake_os)
+    usage = ns['disk_usage'](['/synthetic'], stopped=stopped)
+    assert len(visited) == (10001 if stop_after is None else stop_after)
+    assert (usage > ns['AGGREGATE_DISK']) is (stop_after is None)
+
+
+def test_disk_scan_stops_at_byte_budget(tmp_path):
+    for i in range(100):
+        (tmp_path / str(i)).write_bytes(os.urandom(8192))
+    one_file = (tmp_path / '0').stat().st_blocks * 512
+    ns = disk_namespace(AGGREGATE_DISK=one_file)
+    assert ns['disk_usage']([tmp_path]) == 2 * one_file
+
+
+@pytest.mark.parametrize('blocked_stat', [False, True])
+def test_50k_entry_tree_cannot_delay_signed_receipt(blocked_stat):
+    import time
+    # Keep the actual disk scanner/watchdog and signing path, replacing only
+    # host containment and the tree with 50k synthetic empty directory entries.
+    # A blocked stat additionally proves even uncancellable I/O cannot delay sign.
+    def transform(source):
+        nodes = [n for n in ast.parse(RUNNER).body if isinstance(n, ast.FunctionDef)
+                 and n.name in ('disk_usage', 'disk_watchdog')]
+        monitoring = '\n\n'.join(ast.unparse(n) for n in nodes)
+        fixture = '''
+from contextlib import contextmanager
+from types import SimpleNamespace
+@contextmanager
+def synthetic_tree(fd):
+    def entries():
+        for i in range(50000):
+            def info(**kwargs):
+                if BLOCKED: time.sleep(60)
+                return SimpleNamespace(st_mode=stat.S_IFREG, st_blocks=0, st_dev=1, st_ino=i)
+            yield SimpleNamespace(stat=info)
+    yield entries()
+os.scandir = synthetic_tree
+def candidate_processes():
+    return []
+def kill_candidate(pgid):
+    try: os.kill(pgid, signal.SIGKILL)
+    except ProcessLookupError: pass
+'''.replace('BLOCKED', repr(blocked_stat))
+        monitoring = monitoring.replace("roots=('/tmp', '/var/tmp', '/dev/shm')", 'roots=(work,)')
+        return source.replace('def run_step(', monitoring + '\n' + fixture + '\ndef run_step(')
+    started = time.monotonic()
+    receipt = run_fixture(compile_code='import time; time.sleep(0.5)',
+                          run_code="print('MUST_NOT_RUN')", transform=transform)
+    assert time.monotonic() - started < 3
+    assert receipt['stage'] == 'compile'
+    assert receipt['supervisor_error'] is blocked_stat
+    assert receipt['disk_exceeded'] is (not blocked_stat)
+    assert 'MUST_NOT_RUN' not in receipt['output']
+
+
+def test_both_stuck_watchdogs_have_bounded_joins():
+    import time
+    def transform(source):
+        for name in ('memory_watchdog', 'disk_watchdog'):
+            source = source.replace(f'def {name}(*args):\n    pass',
+                                    f'def {name}(*args):\n    time.sleep(60)')
+        return source
+    started = time.monotonic()
+    receipt = run_fixture(transform=transform)
+    assert time.monotonic() - started < 3
+    assert receipt['supervisor_error']
+    assert receipt['stage'] == 'compile'
+
+
+@pytest.mark.parametrize('source', [SETUP, RUNNER], ids=['setup', 'runner'])
+@pytest.mark.parametrize('failed_prctl', [None, 38, 8])
+def test_restrict_child_drops_capabilities_in_order(source, failed_prctl):
+    from types import SimpleNamespace
+    from contextlib import contextmanager
+    calls = []
+
+    @contextmanager
+    def opened(path, mode):
+        calls.append(('open', path, mode))
+        yield SimpleNamespace(write=lambda value: calls.append(('oom', value)))
+
+    def prctl(*args):
+        calls.append(('prctl', *args))
+        return int(args[0] == failed_prctl)
+
+    def exit_child(code):
+        calls.append(('exit', code))
+        raise SystemExit(code)
+
+    fake_os = SimpleNamespace(
+        setgroups=lambda groups: calls.append(('groups', groups)),
+        setresgid=lambda *ids: calls.append(('gid', *ids)),
+        setresuid=lambda *ids: calls.append(('uid', *ids)), _exit=exit_child)
+    node = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef)
+                and n.name == 'restrict_child')
+    ns = dict(os=fake_os, libc=SimpleNamespace(prctl=prctl), open=opened,
+              CANDIDATE_UID=65532, CANDIDATE_GID=65532,
+              candidate_limits=lambda java: calls.append(('limits', java)))
+    exec(compile(ast.Module(body=[node], type_ignores=[]), '<restrict>', 'exec'), ns)
+    expected = [('open', '/proc/self/oom_score_adj', 'w'), ('oom', '1000'),
+                ('prctl', 38, 1, 0, 0, 0), ('prctl', 8, 0, 0, 0, 0),
+                ('groups', []), ('gid', 65532, 65532, 65532),
+                ('uid', 65532, 65532, 65532), ('limits', False)]
+    if failed_prctl:
+        with pytest.raises(SystemExit) as stopped:
+            ns['restrict_child']()
+        assert stopped.value.code == 125
+        expected = expected[:3 if failed_prctl == 38 else 4] + [('exit', 125)]
+    else:
+        ns['restrict_child']()
+    assert calls == expected
+
+
+@pytest.mark.parametrize('failure', [None, 'root', 'dumpable', 'proc_list', 'oom_open',
+                                    'oom_write', 'work_create', 'script_write', 'spawn',
+                                    'fd_stat', 'status_read', 'uid', 'rss',
+                                    'work_write', 'noexec'])
+def test_setup_prerequisites_fail_before_publishing_request(monkeypatch, tmp_path, failure):
+    import builtins
+    import ctypes
+    import io
+    from types import SimpleNamespace
+    original_open, original_stat = builtins.open, os.stat
+    launched, executed, cleanup = [], [], []
+    work = tmp_path / 'cjt-probe'
+
+    def mkdtemp(**kwargs):
+        assert kwargs == dict(prefix='cjt-', dir='/tmp')
+        if failure == 'work_create':
+            raise PermissionError('private failure details')
+        work.mkdir()
+        return str(work)
+
+    def opened(path, mode='r', **kwargs):
+        path = str(path)
+        if path == '/proc/self/oom_score_adj':
+            assert mode == 'r+'
+            if failure == 'oom_open':
+                raise PermissionError('private failure details')
+            class Oom(io.StringIO):
+                def write(self, value):
+                    if failure == 'oom_write':
+                        raise PermissionError('private failure details')
+                    assert value == '0\n'
+                    return super().write(value)
+            return Oom('0\n')
+        if path == '/proc/123/status':
+            if failure == 'status_read':
+                raise PermissionError('private failure details')
+            return io.StringIO(('Uid: 0 0 0 0\n' if failure == 'uid' else
+                                'Uid: 65532 65532 65532 65532\n') +
+                               ('' if failure == 'rss' else 'VmRSS: 1024 kB\n'))
+        if path.endswith('/probe/check') and failure == 'script_write':
+            raise PermissionError('private failure details')
+        return original_open(path, mode, **kwargs)
+
+    def proc_stat(path, **kwargs):
+        if str(path) == '/proc/123/fd/0':
+            if failure == 'fd_stat':
+                raise PermissionError('private failure details')
+            return SimpleNamespace()
+        return original_stat(path, **kwargs)
+
+    def listdir(path):
+        assert path == '/proc'
+        if failure == 'proc_list':
+            raise PermissionError('private failure details')
+        return ['1', 'self']
+
+    def popen(command, **kwargs):
+        assert command == [sys.executable, '-I', '-c', 'import time; time.sleep(2)']
+        assert kwargs['preexec_fn'] is ns['restrict_child']
+        assert kwargs['close_fds']
+        if failure == 'spawn':
+            raise subprocess.SubprocessError('private failure details')
+        launched.append(command)
+        return SimpleNamespace(pid=123, kill=lambda: cleanup.append('kill'),
+                               wait=lambda **kw: cleanup.append('wait'))
+
+    def run(command, **kwargs):
+        assert kwargs['preexec_fn'] is ns['restrict_child']
+        assert kwargs['timeout'] == 1 and kwargs['check'] and kwargs['close_fds']
+        script = Path(command[0])
+        assert script.read_text().startswith('#!/bin/sh\n')
+        assert script.stat().st_mode & 0o111 == 0o111
+        assert Path(kwargs['cwd']) == work / 'probe'
+        if failure == 'noexec':
+            raise PermissionError('private failure details')
+        if failure == 'work_write':
+            raise subprocess.CalledProcessError(1, command)
+        (work / 'probe/writable').write_text('ready')
+        executed.append(command)
+
+    monkeypatch.setattr(ctypes, 'CDLL', lambda *a, **kw: SimpleNamespace(
+        prctl=lambda *a: int(failure == 'dumpable')))
+    monkeypatch.setattr(os, 'getuid', lambda: 1 if failure == 'root' else 0)
+    monkeypatch.setattr(os, 'chown', lambda *a: None)
+    monkeypatch.setattr(os, 'listdir', listdir)
+    monkeypatch.setattr(os, 'stat', proc_stat)
+    monkeypatch.setattr(builtins, 'open', opened)
+    monkeypatch.setattr(tempfile, 'mkdtemp', mkdtemp)
+    monkeypatch.setattr(subprocess, 'Popen', popen)
+    monkeypatch.setattr(subprocess, 'run', run)
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(json.dumps(dict(files={}, output_limit=4096))))
+    published = io.StringIO()
+    monkeypatch.setattr(sys, 'stdout', published)
+    ns = {}
+    if failure:
+        with pytest.raises(SystemExit) as stopped:
+            exec(SETUP, ns)
+        assert stopped.value.code == 'Sandbox prerequisites unavailable.'
+        assert published.getvalue() == ''
+        assert not (work / 'request.json').exists()
+    else:
+        exec(SETUP, ns)
+        receipt = json.loads(published.getvalue())
+        assert receipt['cwd'] == str(work)
+        assert len(bytes.fromhex(receipt['key'])) == 32
+        assert json.loads((work / 'request.json').read_text())['key'] == receipt['key']
+        assert work.stat().st_mode & 0o777 == 0o700
+        assert len(executed) == 1
+    assert cleanup == (['kill', 'wait'] if launched else [])
+    if launched:
+        assert not (work / 'probe').exists()
+
+
+@pytest.mark.parametrize('error', [PermissionError, FileNotFoundError, ProcessLookupError])
+@pytest.mark.parametrize('monitor', ['memory_watchdog', 'disk_watchdog'])
+def test_watchdogs_skip_unreadable_process_and_keep_scanning(error, monitor):
+    import io
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    scanned = []
+
+    def read(path):
+        scanned.append(path)
+        if path == '/proc/1/status':
+            raise error()
+        return io.StringIO('Uid: 65532 65532 65532 65532\nVmRSS: 1024 kB\n')
+
+    fake_os = SimpleNamespace(listdir=lambda path: ['1', '2', 'self'],
+                              scandir=lambda path: nullcontext(iter([])))
+    ns = disk_namespace(os=fake_os, open=read, CANDIDATE_UID=65532,
+                        AGGREGATE_MEMORY=1, WATCHDOG_INTERVAL=0.05, DISK_WATCHDOG_INTERVAL=0.1)
+    nodes = [n for n in ast.parse(RUNNER).body if isinstance(n, ast.FunctionDef)
+             and n.name in ('candidate_processes', monitor)]
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), '<watchdog>', 'exec'), ns)
+    usage = ns['disk_usage']
+    ns['disk_usage'] = lambda **kw: usage(roots=(), **kw)
+    killed = []
+    ns['kill_candidate'] = lambda *args: killed.append(args)
+    stopped = threading.Event()
+    # Single scan for the non-tripping disk monitor.
+    stop = SimpleNamespace(is_set=stopped.is_set, wait=lambda _: stopped.set())
+    status = dict(supervisor_error=False)
+    ns[monitor](123, stop, status)
+    assert not status['supervisor_error']
+    assert scanned == ['/proc/1/status', '/proc/2/status']
+    if monitor == 'memory_watchdog':
+        assert status['memory_exceeded']
+        assert killed == [(123, [(2, 1024**2)])]
+    else:
+        assert not killed
+
+
+@pytest.mark.parametrize('error', [PermissionError, FileNotFoundError, ProcessLookupError])
+@pytest.mark.parametrize('site', ['descriptor', 'fd_directory', 'tree_entry', 'tree_directory'])
+def test_disk_scan_skips_one_inaccessible_entry(error, site, tmp_path):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    import stat
+    paths = []
+    info = SimpleNamespace(st_mode=stat.S_IFREG, st_dev=1, st_ino=2, st_blocks=16)
+
+    def entry_stat(bad=False):
+        if bad:
+            raise error()
+        return info
+
+    def scandir(path):
+        paths.append(path)
+        if path == '/proc/1/fd' and site == 'fd_directory':
+            raise error()
+        if isinstance(path, int):
+            if site == 'tree_directory':
+                raise error()
+            return nullcontext(iter([
+                SimpleNamespace(stat=lambda **kw: entry_stat(True)),
+                SimpleNamespace(stat=lambda **kw: entry_stat())]))
+        return nullcontext(iter([SimpleNamespace(path=path + '/bad'),
+                                 SimpleNamespace(path=path + '/good')]))
+
+    def proc_stat(path):
+        if path.endswith('/bad'):
+            raise error()
+        return info
+
+    fake_os = SimpleNamespace(**{name: getattr(os, name) for name in
+        ('open', 'close', 'O_RDONLY', 'O_DIRECTORY', 'O_NOFOLLOW')},
+        scandir=scandir, stat=proc_stat)
+    ns = disk_namespace(os=fake_os, candidate_processes=lambda: [(1, 0), (2, 0)])
+    assert ns['disk_usage']([tmp_path] if site.startswith('tree') else []) == 8192
+    assert '/proc/2/fd' in paths
+
+
+@pytest.mark.parametrize('monitor', ['memory_watchdog', 'disk_watchdog'])
+def test_watchdogs_fail_closed_when_proc_cannot_be_enumerated(monitor):
+    from types import SimpleNamespace
+    def listdir(path):
+        assert path == '/proc'
+        raise PermissionError('cannot enumerate proc')
+    ns = disk_namespace(os=SimpleNamespace(listdir=listdir))
+    nodes = [n for n in ast.parse(RUNNER).body if isinstance(n, ast.FunctionDef)
+             and n.name in ('candidate_processes', monitor)]
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), '<watchdog>', 'exec'), ns)
+    usage = ns['disk_usage']
+    ns['disk_usage'] = lambda **kw: usage(roots=(), **kw)
+    killed = []
+    ns['kill_candidate'] = killed.append
+    status = dict(supervisor_error=False)
+    ns[monitor](123, threading.Event(), status)
+    assert status['supervisor_error']
+    assert killed == [123]

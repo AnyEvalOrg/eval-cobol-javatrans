@@ -7,9 +7,18 @@ services:
     command: ["sleep", "infinity"]
     working_dir: /tmp
     user: "0:0"
+    read_only: true
+    # Anonymous disk volume permits compiler execution; the watchdog is the
+    # byte/inode bound. Compose has no portable size quota for disk volumes.
+    volumes:
+      - type: volume
+        target: /tmp
+    # A read-only tmpfs replaces Docker's writable default /dev/shm.
+    tmpfs:
+      - /dev/shm:ro,size=16m
     network_mode: none
     cap_drop: [ALL]
-    cap_add: [SETUID, SETGID, KILL, CHOWN, DAC_OVERRIDE]
+    cap_add: [SETUID, SETGID, KILL, CHOWN, DAC_OVERRIDE, SYS_PTRACE]
     security_opt:
       - no-new-privileges:true
     mem_limit: 2g

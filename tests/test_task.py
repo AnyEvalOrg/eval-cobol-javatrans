@@ -19,9 +19,12 @@ def test_docker_task_builds_offline():
     service = config["services"]["default"]
     assert service["image"] == "eval-cobol-sandbox:local"
     assert service["build"]["dockerfile"] == "Dockerfile"
-    assert set(service["cap_add"]) == {"SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE"}
+    assert set(service["cap_add"]) == {"SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE", "SYS_PTRACE"}
     assert service["network_mode"] == "none"
     assert service["user"] == "0:0"
+    assert service["read_only"] is True
+    assert service["volumes"] == [{"type": "volume", "target": "/tmp"}]
+    assert service["tmpfs"] == ["/dev/shm:ro,size=16m"]
     assert not task.dataset[0].target
 
 
@@ -162,14 +165,14 @@ def test_render_default_chart_matches_anyeval_pod_contract(helm):
     values = yaml.safe_load(config.values.read_text())
     assert security == values["services"]["default"]["securityContext"]
     assert security["runAsUser"] == security["runAsGroup"] == 0
-    assert set(security["capabilities"]["add"]) == {"SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE"}
+    assert set(security["capabilities"]["add"]) == {"SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE", "SYS_PTRACE"}
     assert not security.get("privileged", False)
     assert security["seccompProfile"] == {"type": "RuntimeDefault"}
     assert security["runAsNonRoot"] is False
     assert security["allowPrivilegeEscalation"] is False
     assert security["readOnlyRootFilesystem"] is True
     assert container["volumeMounts"] == [
-        {"name": "tmp", "mountPath": "/tmp"}, {"name": "shm", "mountPath": "/dev/shm"}]
+        {"name": "tmp", "mountPath": "/tmp"}, {"name": "shm", "mountPath": "/dev/shm", "readOnly": True}]
     assert spec["volumes"] == [
         {"name": "tmp", "emptyDir": {"sizeLimit": "512Mi"}},
         {"name": "shm", "emptyDir": {"medium": "Memory", "sizeLimit": "16Mi"}}]
@@ -235,3 +238,24 @@ def test_reverse_task_and_anyeval_catalog_match():
     assert catalog['tasks'] == [{'name': 'cobol_to_java', 'samples': 143}, {'name': 'java_to_cobol', 'samples': 143}]
     assert catalog['total_samples'] == 286
     assert catalog['upstream']['commit'] == '2b14b7bf7e55556205654c6f7657fa60e36251fa'
+
+
+def test_render_provider_chart_has_identical_candidate_storage(helm):
+    provider = pytest.importorskip("k8s_sandbox")
+    chart = Path(provider.__file__).parent / "resources/helm/agent-env"
+    values = cobol_javatrans(anyeval_chart=False).sandbox.config
+    result = subprocess.run(
+        [helm, "template", "cjt-provider", str(chart), "-n", "anyeval-sandbox", "-f", str(values)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    resources = [r for r in yaml.safe_load_all(result.stdout) if r]
+    workload = next(r for r in resources if r["kind"] == "StatefulSet")
+    spec = workload["spec"]["template"]["spec"]
+    service = yaml.safe_load(Path(values).read_text())["services"]["default"]
+    container = next(c for c in spec["containers"] if c["name"] == "default")
+    assert container["securityContext"]["capabilities"] == {
+        "drop": ["ALL"], "add": ["SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE", "SYS_PTRACE"]}
+    assert container["securityContext"]["readOnlyRootFilesystem"] is True
+    assert [v for v in spec["volumes"] if v["name"] in {"tmp", "shm"}] == service["volumes"]
+    assert [v for v in container["volumeMounts"] if v["name"] in {"tmp", "shm"}] == service["volumeMounts"]

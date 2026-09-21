@@ -506,3 +506,20 @@ def test_signed_resource_failure(monkeypatch, kind, flag, reason):
     install_sandbox(monkeypatch, fake)
     score = asyncio.run(scoring.translation_scorer(kind)(state(kind), Target('')))
     assert score.value == INCORRECT and score.explanation == f'Test 1: {reason}'
+
+
+@pytest.mark.parametrize('valid_json', [False, True])
+def test_nonzero_setup_is_withheld_harness_error_without_candidate_launch(monkeypatch, valid_json):
+    class FailedSetup(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if scoring.SETUP in cmd:
+                self.calls.append((cmd, kwargs))
+                output = json.dumps(dict(cwd='/tmp/cjt-probe', key=self.key.hex())) if valid_json else ''
+                return ExecResult(success=False, returncode=1, stdout=output,
+                                  stderr='Sandbox prerequisites unavailable.')
+            assert scoring.RUNNER not in cmd
+            return await super().exec(cmd, **kwargs)
+    fake = FailedSetup([])
+    install_sandbox(monkeypatch, fake)
+    assert_harness_failure()
+    assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND

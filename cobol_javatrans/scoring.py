@@ -77,6 +77,8 @@ def translation_scorer(direction: str):
                                  "/usr/local/bin/python3", "-I", "-c", SETUP],
                                 cwd="/", input=request, timeout=5, timeout_retry=False,
                             )
+                        if setup.returncode != 0:
+                            raise RuntimeError("Sandbox setup failed")
                         setup_receipt = json.loads(setup.stdout)
                         work = setup_receipt["cwd"]
                         key = bytes.fromhex(setup_receipt["key"])

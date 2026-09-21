@@ -27,15 +27,6 @@ spec:
       resources:
         {{- toYaml $service.resources | nindent 8 }}
       volumeMounts:
-        - name: tmp
-          mountPath: /tmp
-        - name: shm
-          mountPath: /dev/shm
+        {{- toYaml $service.volumeMounts | nindent 8 }}
   volumes:
-    - name: tmp
-      emptyDir:
-        sizeLimit: 512Mi
-    - name: shm
-      emptyDir:
-        medium: Memory
-        sizeLimit: 16Mi
+    {{- toYaml $service.volumes | nindent 4 }}

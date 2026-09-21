@@ -17,15 +17,17 @@ from cobol_javatrans.receipt import verify_receipt, receipt_failure
 from cobol_javatrans.sandbox_runner import SETUP, RUNNER, QUIESCENCE_CHECK_COMMAND
 from cobol_javatrans.scoring import cleanup_candidate
 from scripts.linux_regressions import (
-    INVALID_BYTES, FORK_EXHAUSTION, AGGREGATE_MEMORY, DISK_EXHAUSTION,
-    DETACHED_CHILD, FLAGS, PYTHON, request_for,
+    INVALID_BYTES, FORK_EXHAUSTION, AGGREGATE_MEMORY,
+    DETACHED_CHILD, DISK_CASES, SHM_WRITE, PTRACE_DENIED, FLAGS, PYTHON, request_for,
 )
 
 CASES = {
     'invalid_bytes': INVALID_BYTES,
     'fork_exhaustion': FORK_EXHAUSTION,
     'aggregate_memory': AGGREGATE_MEMORY,
-    'disk': DISK_EXHAUSTION,
+    **DISK_CASES,
+    'shm_write': SHM_WRITE,
+    'ptrace_denied': PTRACE_DENIED,
     'detached_child': DETACHED_CHILD,
 }
 
@@ -37,7 +39,7 @@ def expected_receipt(name, receipt):
         return False
     if name != 'fork_exhaustion' and bool(receipt.get('memory_exceeded')) != (name == 'aggregate_memory'):
         return False
-    if bool(receipt.get('disk_exceeded')) != (name == 'disk'):
+    if bool(receipt.get('disk_exceeded')) != (name in DISK_CASES):
         return False
     if bool(receipt['output_not_decodable']) != (name == 'invalid_bytes'):
         return False
@@ -49,8 +51,12 @@ def expected_receipt(name, receipt):
             receipt['returncode'] == 1 and 0 < int(receipt['output'].strip()) < 64)
     if name == 'aggregate_memory':
         return receipt.get('memory_exceeded', False) and receipt['returncode'] != 0
-    if name == 'disk':
+    if name in DISK_CASES:
         return receipt.get('disk_exceeded', False) and receipt['returncode'] != 0
+    if name == 'ptrace_denied':
+        return receipt['returncode'] == 1 and receipt['output'] == 'ptrace denied\n'
+    if name == 'shm_write':
+        return receipt['returncode'] == 1
     return receipt_failure(receipt) is None
 
 
@@ -63,7 +69,7 @@ def regressions():
         with private_grading(sandbox()) as env:
             for name, code in CASES.items():
                 flags = dict(authenticated=False, expected=False,
-                             cleanup_ok=False, pod_usable=False)
+                             cleanup_ok=False, pod_usable=False, receipt_within_deadline=False)
                 cleanup_after = 0
                 try:
                     async with asyncio.timeout(10):
@@ -71,7 +77,8 @@ def regressions():
                             ['timeout', '-s', 'KILL', '5s', PYTHON, '-I', '-c', SETUP],
                             input=json.dumps(request_for(code)), cwd='/', timeout=5, timeout_retry=False)
                     setup = json.loads(setup_result.stdout)
-                    cleanup_after = asyncio.get_running_loop().time() + 45
+                    started = asyncio.get_running_loop().time()
+                    cleanup_after = started + 45
                     async with asyncio.timeout(45):
                         result = await env.exec(
                             ['timeout', '-s', 'KILL', '40s', PYTHON, '-I', '-c', RUNNER, setup['cwd']],
@@ -80,6 +87,7 @@ def regressions():
                     if receipt is not None and receipt['cwd'] == setup['cwd']:
                         cleanup_after = 0
                         flags['authenticated'] = True
+                        flags['receipt_within_deadline'] = asyncio.get_running_loop().time() - started < 40
                         flags.update({k: bool(receipt.get(k, False)) for k in FLAGS})
                         flags['expected'] = bool(expected_receipt(name, receipt))
                 except Exception:
@@ -111,7 +119,7 @@ def regression_score():
     async def score(state, target):
         summary = state.metadata.get('regression_flags', {})
         passed = set(summary) == set(CASES) and all(
-            all(flags.get(k, False) for k in ('authenticated', 'expected', 'cleanup_ok', 'pod_usable'))
+            all(flags.get(k, False) for k in ('authenticated', 'expected', 'cleanup_ok', 'pod_usable', 'receipt_within_deadline'))
             for flags in summary.values())
         return Score(value=CORRECT if passed else INCORRECT)
     return score

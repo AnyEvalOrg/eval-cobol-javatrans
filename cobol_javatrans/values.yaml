@@ -26,24 +26,40 @@ services:
       readOnlyRootFilesystem: true
       capabilities:
         drop: ["ALL"]
-        add: ["SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE"]
+        add: ["SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE", "SYS_PTRACE"]
       seccompProfile:
         type: RuntimeDefault
     # Equal CPU/memory requests and limits give Guaranteed QoS and reserve the
     # full 2 GiB, avoiding memory overcommit onto the supervisor's node budget.
     # Aggregate UID RSS watchdog: 768 MiB + at most one 50 ms allocation burst
-    # + file cache, /dev/shm and supervisor headroom within 2 GiB.
+    # + file cache, descriptor-retained bytes and supervisor headroom within 2 GiB.
     # Native AS/DATA: 1 GiB/process. JVM heap/metaspace/code: 512/256/64 MiB
     # (8 GiB virtual AS/DATA); all resident candidate memory is watched.
     # gVisor records oom_score_adj but does not use it: it is NOT containment.
-    # Read-only root; /tmp is DISK-backed emptyDir, sizeLimit 512 MiB is an
-    # eviction backstop, not a synchronous write limit. Pod ephemeral-storage:
-    # 1 GiB. The supervisor watches all regular-file allocated blocks under
-    # /tmp and /dev/shm: 256 MiB + one 100 ms write burst. gVisor gofer write
-    # throughput makes the burst small. Do not rely on tmpfs sizeLimit under
-    # gVisor: Memory emptyDir limits are not enforced as tmpfs mount sizes.
-    # /dev/shm remains Memory emptyDir with sizeLimit 16 MiB; the disk watchdog
-    # includes it. /tmp holds work, compiler scratch, requests and captured streams.
+    # Read-only root and /dev/shm: zero candidate-writable memory-backed mount
+    # capacity. /tmp is disk-backed; 512 MiB sizeLimit is an eviction backstop.
+    # Watchdog: 256 MiB directory-visible + descriptor-retained allocated bytes
+    # (including unlinked files/memfds), de-duplicated by device/inode, plus one
+    # scan + 100 ms write burst. More than 10,000 directory entries also trips it.
+    # Native/Java NOFILE: 256/1024 per process; at most 64 candidate processes.
+    # 768 MiB RSS + 256 MiB file budget = 1 GiB before bursts/cache/supervisor,
+    # leaving 1 GiB of the 2 GiB container budget as headroom. This is sampled
+    # enforcement, not a synchronous quota. Memory emptyDir sizeLimit alone
+    # is not a gVisor tmpfs limit; readOnly is the /dev/shm boundary.
+    volumes:
+      - name: tmp
+        emptyDir:
+          sizeLimit: 512Mi
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Mi
+    volumeMounts:
+      - name: tmp
+        mountPath: /tmp
+      - name: shm
+        mountPath: /dev/shm
+        readOnly: true
     resources:
       requests:
         cpu: "1"

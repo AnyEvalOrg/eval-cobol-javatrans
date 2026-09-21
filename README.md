@@ -87,7 +87,15 @@ caller gets its own pair and directory. There is no candidate-controlled Python
 driver or printed pass marker.
 
 The template's setup exec creates an unpredictable `/tmp/cjt-*` directory and
-locally generates a 256-bit HMAC key. The root supervisor reads and unlinks the
+checks Linux prerequisites before publishing a receipt or running candidate code.
+A short-lived trusted probe uses the exact candidate credential-drop path. SETUP
+verifies cross-UID fd access, readable UID/RSS status, `/proc` enumeration, writable
+`oom_score_adj`, and writing/executing a script in the work directory as UID 65532.
+Any failure exits nonzero with a fixed message and becomes a withheld harness
+error, never an INCORRECT candidate verdict. Individual inaccessible or vanished
+proc entries are skipped during monitoring; failure to enumerate `/proc` still
+sets the signed `supervisor_error` flag. Residual post-launch supervisor errors
+remain INCORRECT. Successful setup locally generates a 256-bit HMAC key. The root supervisor reads and unlinks the
 request before launching children. Only `candidate/` is UID-owned; its parent is
 root-owned. Supervisor memory/file descriptors are protected by `PR_SET_DUMPABLE=0`.
 Each compiler/runtime child clears supplementary groups, irreversibly drops real,
@@ -109,7 +117,7 @@ No directory deletion or interpreter finalizers run in that exec.
 Native compiler/runtime children have hard **1 GiB RLIMIT_AS and RLIMIT_DATA**
 limits. Java steps use **8 GiB** virtual address/data limits to accommodate JVM
 reservations and `JAVA_TOOL_OPTIONS="-Xmx512m -XX:MaxMetaspaceSize=256m
--XX:ReservedCodeCacheSize=64m -Xss1m"`. These limits are clamped to any tighter
+-XX:ReservedCodeCacheSize=64m -Xss1m -XX:-UsePerfData"`. These limits are clamped to any tighter
 inherited hard limits. The root preexec child writes `1000` to its
 `/proc/self/oom_score_adj` before dropping credentials; descendants inherit the
 OOM preference on native Linux; gVisor records this setting but does not use it.
@@ -121,14 +129,27 @@ signs `memory_exceeded=True`, which scores INCORRECT (`memory limit exceeded`).
 gVisor counts copy-on-write pages in each fork's VmRSS, so fork exhaustion may
 legitimately trip this conservative budget. Compiler/JVM chains use a handful of
 processes and stay far below 768 MiB. Core dumps remain disabled and RLIMIT_FSIZE
-remains 1 MiB per file.
+remains 1 MiB per file. Hard RLIMIT_NOFILE is **256 for native steps** and
+**1024 for javac/java**, bounding descriptor scanning across at most 64 processes.
+Java perf data is disabled so JVMs do not attempt hsperfdata files.
 
-A second supervisor watchdog scans **all of `/tmp` and `/dev/shm` every 100 ms**,
-summing `st_blocks * 512` for regular files with a race-tolerant `os.scandir` walk
-that does not follow symlinks. Above **256 MiB**, it uses the same immediate kill
-path and signs `disk_exceeded=True`, scoring INCORRECT (`disk limit exceeded`).
+A second supervisor watchdog scans **all of `/tmp`, `/var/tmp`, and `/dev/shm`**,
+then every `/proc/<pid>/fd` for UID 65532, with **100 ms between scans**. It sums
+`st_blocks * 512` for regular files, de-duplicated by `(st_dev, st_ino)` across the
+directory walk and all descriptors. Directory traversal does not follow symlinks;
+`os.stat` follows procfs descriptor magic links to include **unlinked-but-open files
+and memfds**, even when their contents are not resident in VmRSS. Above **256 MiB**
+or **10,000 directory entries** (including empty files, directories and symlinks),
+it immediately kills the candidate and signs `disk_exceeded=True`, scoring
+INCORRECT (`disk limit exceeded`). Every entry checks cancellation and the running
+budget; traversal stops as soon as either applies.
+
 Both watchdogs remain active through process cleanup; either flag blocks the next
-stage. Directory deletion still belongs to the independent cleanup exec.
+stage. Afterwards the supervisor sets their stop event and joins each for **at
+most 0.2 seconds**. A still-running watcher adds `supervisor_error` and blocks the
+next stage, but never delays signing beyond that join. Scanning never runs on the
+signing thread; daemon watchdogs die at `os._exit(0)`. Directory deletion belongs
+to the independent cleanup exec.
 
 The host always performs the template's separate bounded
 `/usr/bin/pkill -KILL -u 65532` cleanup exec, even after setup failures, lost or
@@ -214,17 +235,35 @@ Never. Requests equal limits: **1 CPU, 2 GiB memory, 1 GiB ephemeral storage**.
 Equal CPU/memory reservations provide Guaranteed QoS and reserve the supervisor's
 memory headroom; `values.yaml` documents the candidate memory budgets. The sandbox
 root filesystem is read-only. `/tmp` is a **disk-backed `emptyDir`** with
-**512Mi sizeLimit** as an eviction backstop. `/dev/shm` remains a Memory `emptyDir`
-with **16Mi sizeLimit**. Production gVisor does not enforce Memory `emptyDir`
-sizeLimit as a tmpfs mount size, so containment uses the supervisor's disk
-watchdog: **256 MiB + one 100 ms write burst** across both mounts. gVisor gofer
-write throughput makes this burst small relative to the 512 MiB backstop and
-1 GiB pod ephemeral-storage budget.
+**512Mi sizeLimit** as an eviction backstop. `/dev/shm` is a **read-only** Memory
+`emptyDir` (16Mi sizeLimit), giving **zero candidate-writable memory-backed
+filesystem capacity**. `/var/tmp` is read-only with the root filesystem but is
+also included in watchdog roots. Both custom and provider chart paths use these
+same volume and mount definitions from `values.yaml`. Compose uses a read-only
+root, an anonymous **disk volume** at `/tmp`, and a read-only 16 MiB tmpfs at
+`/dev/shm`. Compose has no portable disk-volume size quota; the watchdog provides
+the byte and entry bounds.
+
+The sampled file budget now covers **directory-visible plus descriptor-retained
+bytes**, including anonymous memfds: **256 MiB + writes during a scan and its
+100 ms interval**. The memory arithmetic is **768 MiB aggregate RSS + 256 MiB file
+budget = 1 GiB**, leaving **1 GiB** of the 2 GiB container budget for sampling
+bursts, cache and the supervisor. RSS/file accounting can overlap, conservatively.
+The limits are sampled, not synchronous quotas; neither gVisor Memory `emptyDir`
+sizeLimit nor disk `emptyDir` sizeLimit is relied on as a synchronous write bound.
+The disk mount's 512 MiB eviction backstop and pod's 1 GiB ephemeral-storage budget
+remain additional backstops; memfds are counted by the watchdog, not disk eviction.
 Autopilot supplies the Spot toleration; the chart adds none. The task defaults
 `INSPECT_K8S_DEFAULT_NAMESPACE` to `anyeval-sandbox` without overriding an existing
-setting. Trusted execs run as root with only SETUID, SETGID, KILL, CHOWN, and
-DAC_OVERRIDE; privilege escalation is disabled and seccomp is RuntimeDefault.
-Candidates receive none of those capabilities.
+setting. Both chart paths and Compose give trusted root execs only SETUID, SETGID,
+KILL, CHOWN, DAC_OVERRIDE, and SYS_PTRACE; privilege escalation is disabled and
+seccomp is RuntimeDefault. SYS_PTRACE permits the supervisor to follow cross-UID
+`/proc/<pid>/fd` magic links for disk accounting (Linux PTRACE_MODE_READ checks).
+Candidates receive none of these capabilities: `PR_SET_NO_NEW_PRIVS`,
+`PR_SET_KEEPCAPS=0`, and the irreversible `setresuid(65532, 65532, 65532)` clear
+permitted/effective capabilities and prevent privilege gains on exec. Docker and
+k8s regressions require a signed nonzero exit proving `PermissionError` when a
+candidate tries `os.stat('/proc/1/fd/0')` and the actual supervisor's fd 0.
 
 The explicit `-T anyeval_chart=false` template compatibility option selects the
 provider's built-in Cilium chart for other clusters, with its CoreDNS dependency;
@@ -255,7 +294,9 @@ network access and need no model, Docker daemon, or cluster. They check all reco
 against the supplied source, deterministic rebuilding, field-taint privacy,
 comparison edge cases, fake-sandbox failures/cancellation/cleanup, authenticated
 supervisor mechanics using authored fixtures, actual Helm rendering/strict lint,
-and rejection of deliberately broken chart templates. Local supervisor fixtures
+provider-chart storage parity, Compose storage settings, and rejection of
+deliberately broken chart templates. Synthetic 50,000-entry and blocked-filesystem
+fixtures verify that authenticated receipts meet the deadline. Local supervisor fixtures
 stub Linux credentials, prctl, memory/process limits, OOM preference, and UID sweeping; they are **not Linux containment
 attestation**. Full JVM/GnuCOBOL execution and Linux isolation need the image.
 Two opt-in Linux regressions are skipped unless running as root in a disposable
@@ -268,7 +309,12 @@ shared receipt verifier as root inside the reference image, with no Inspect
 installation. It first checks real `javac`/`java` and `cobc`/COBOL startup under the
 limits, then checks invalid UTF-8, detached children exhausting their fork budget,
 aggregate memory allocation (three children allocating 600 MiB each), and
-unbounded 1 MiB file writes until the disk watchdog kills the candidate. Each attack must produce an authenticated
+unbounded 1 MiB file writes until the disk watchdog kills the candidate. Additional
+cases retain 300 unlinked one-MiB files across four workers, retain 300 MiB in
+memfds across four workers, create 50,000 empty files, and attempt `/dev/shm`
+writes. The first three must sign `disk_exceeded`; the read-only `/dev/shm` attempt
+must exit 1 with no failure flags. Every case checks the receipt deadline and a
+fresh exec after independent cleanup. Each attack must produce an authenticated
 INCORRECT outcome; success logs contain only stage, returncode, and boolean flags.
 Regression failures additionally name the check (`step`, such as
 `compiler_smoke:cobc`), exception class (`error`), and an allowlisted assertion
@@ -278,7 +324,7 @@ printed. The pre-setup UID check uses the cleanup sweep's live-process definitio
 `run` receipt; a successful compile-only receipt does not pass them.
 When Docker is available, aggregate memory and disk exhaustion run in a fresh
 `docker run --memory=2g --memory-swap=2g --pids-limit=128 --read-only
---volume /tmp --shm-size=16m`. The anonymous writable disk volume allows compiler
+--volume /tmp --tmpfs /dev/shm:ro,size=16m`. The anonymous writable disk volume allows compiler
 execution and is removed with the container. The memory case must sign
 `memory_exceeded`; the disk case must sign `disk_exceeded=True` with a nonzero
 returncode. The disk writer creates 64 MiB in its work directory and writes
@@ -292,16 +338,17 @@ path on the Docker daemon host and in the script's container.
 
 The operator-only Inspect task `scripts/k8s_regressions.py` uses the exact package
 Kubernetes chart and values (gVisor, deny-all egress, read-only root, disk-backed
-`/tmp` and Memory `/dev/shm`). It is not registered as a package task. With the operator's `KUBECONFIG`:
+`/tmp` and read-only Memory `/dev/shm`). It is not registered as a package task. With the operator's `KUBECONFIG`:
 
 ```bash
 inspect eval scripts/k8s_regressions.py --model mockllm/model
 ```
 
 It runs the real SETUP + RUNNER against invalid UTF-8, fork exhaustion, three
-600 MiB allocating children, files until `disk_exceeded=True`, and a zero-exit parent leaving a
+600 MiB allocating children, all four disk cases above, the read-only `/dev/shm`
+write attempt, and a zero-exit parent leaving a
 `setsid` child sleeping. CORRECT requires every signed receipt to match its
-expected flags, independent cleanup to succeed, and a fresh sandbox exec to
+expected flags within the receipt deadline, independent cleanup to succeed, and a fresh sandbox exec to
 confirm the pod remains usable after each case. Its JSON summary contains only
 boolean flags, never candidate output, receipts, or keys. This production-runtime
 check, including actual gVisor disk-watchdog containment, requires a live cluster;

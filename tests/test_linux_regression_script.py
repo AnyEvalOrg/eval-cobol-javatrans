@@ -47,7 +47,8 @@ def test_script_uses_actual_setup_runner_and_authenticated_failure(monkeypatch, 
     monkeypatch.setattr(regressions.shutil, 'rmtree', lambda *args, **kwargs: None)
     regressions.check_failure(regressions.INVALID_BYTES, budget=budget)
     assert calls[0] == regressions.QUIESCENCE_CHECK_COMMAND
-    assert calls[-3:] == [regressions.CLEANUP_COMMAND, regressions.QUIESCENCE_COMMAND, regressions.DIRECTORY_CLEANUP_COMMAND]
+    assert calls[-4:] == [regressions.CLEANUP_COMMAND, regressions.QUIESCENCE_COMMAND,
+                          regressions.DIRECTORY_CLEANUP_COMMAND, regressions.QUIESCENCE_CHECK_COMMAND]
     summary = json.loads(capsys.readouterr().out)
     assert set(summary) == {'stage', 'returncode', 'flags'}
     assert summary['flags']['incorrect'] and summary['flags']['output_not_decodable']
@@ -153,6 +154,8 @@ def test_cloudbuild_provides_reference_image_and_nested_docker_socket():
     assert '/var/run/docker.sock:/var/run/docker.sock' in command
     assert 'cp "$$(command -v docker)" /workspace/.linux-regressions/docker' in command
     assert '--docker-cli /workspace/.linux-regressions/docker' in command
+    assert '--read-only --volume /tmp --tmpfs /dev/shm:ro,size=16m' in command
+    assert '--cap-add=SYS_PTRACE' in command
     assert '--image' in command and '${_IMAGE}' in command
     assert '/workspace/scripts/linux_regressions.py' in command
 
@@ -161,7 +164,10 @@ def test_docker_uses_aggregate_memory_and_disk_budgets(monkeypatch, regressions,
     calls = []
     summaries = [
         dict(stage='run', returncode=-9, flags=dict(incorrect=True, memory_exceeded=True)),
-        dict(stage='run', returncode=-9, flags=dict(incorrect=True, disk_exceeded=True)),
+        *[dict(stage='run', returncode=-9, flags=dict(incorrect=True, disk_exceeded=True))
+          for _ in regressions.DISK_CASES],
+        dict(stage='run', returncode=1, flags=dict(incorrect=True)),
+        dict(stage='run', returncode=1, flags=dict(incorrect=True)),
     ]
     def invoke(command, **kwargs):
         calls.append(command)
@@ -169,33 +175,36 @@ def test_docker_uses_aggregate_memory_and_disk_budgets(monkeypatch, regressions,
     monkeypatch.setattr(regressions, 'invoke', invoke)
     regressions.docker_memory_check('docker-fixture', 'reference-image')
     command = calls[1]
-    for option in ('--memory=2g', '--memory-swap=2g', '--read-only', '--shm-size=16m'):
+    for option in ('--memory=2g', '--memory-swap=2g', '--read-only', '--cap-add=SYS_PTRACE', '/dev/shm:ro,size=16m'):
         assert option in command
-    assert '--tmpfs' not in command
+    assert command[command.index('--tmpfs') + 1] == '/dev/shm:ro,size=16m'
     assert command[command.index('--volume') + 1] == '/tmp'
     assert command[-1] == '--memory-child'
     assert calls[-1][:3] == ['docker-fixture', 'rm', '-f']
     assert '-v' in calls[-1]
-    first, second = map(json.loads, capsys.readouterr().out.splitlines())
-    assert first['flags']['memory_exceeded'] and second['flags']['disk_exceeded']
+    reports = list(map(json.loads, capsys.readouterr().out.splitlines()))
+    assert reports[0]['flags']['memory_exceeded']
+    assert all(r['flags']['disk_exceeded'] for r in reports[1:-2])
+    assert all(not any(r['flags'].get(k) for k in regressions.FLAGS) for r in reports[-2:])
 
 
-def test_linux_resource_child_runs_both_candidates(monkeypatch, regressions, capsys):
+def test_linux_resource_child_runs_resource_and_ptrace_candidates(monkeypatch, regressions, capsys):
     codes = []
-    def execute(request):
+    def execute(request, **kwargs):
         code = request['run_argv'][-1]
         codes.append(code)
-        return dict(stage='run', returncode=-9,
+        return dict(stage='run', returncode=1 if code in (regressions.SHM_WRITE, regressions.PTRACE_DENIED) else -9,
                     memory_exceeded=code == regressions.AGGREGATE_MEMORY,
-                    disk_exceeded=code == regressions.DISK_EXHAUSTION,
+                    disk_exceeded=code in regressions.DISK_CASES.values(),
+                    output='ptrace denied\n' if code == regressions.PTRACE_DENIED else '',
                     timeout=False, overflow=False, output_not_decodable=False)
     monkeypatch.setattr(regressions.sys, 'argv', ['linux_regressions.py', '--memory-child'])
     monkeypatch.setattr(regressions.sys, 'platform', 'linux')
     monkeypatch.setattr(regressions.os, 'geteuid', lambda: 0)
     monkeypatch.setattr(regressions, 'execute', execute)
     regressions.main()
-    assert codes == [regressions.AGGREGATE_MEMORY, regressions.DISK_EXHAUSTION]
-    assert len(capsys.readouterr().out.splitlines()) == 2
+    assert codes == [regressions.AGGREGATE_MEMORY, *regressions.DISK_CASES.values(), regressions.SHM_WRITE, regressions.PTRACE_DENIED]
+    assert len(capsys.readouterr().out.splitlines()) == 3 + len(regressions.DISK_CASES)
 
 
 @pytest.mark.parametrize('memory', [False, True])
@@ -206,3 +215,22 @@ def test_fork_accepts_signed_memory_limit(monkeypatch, regressions, memory, caps
     monkeypatch.setattr(regressions, 'execute', lambda *args, **kwargs: receipt)
     regressions.check_failure(regressions.FORK_EXHAUSTION)
     assert json.loads(capsys.readouterr().out)['flags']['incorrect']
+
+
+@pytest.mark.parametrize('returncode,output,supervisor_error,passed', [
+    (1, 'ptrace denied\n', False, True),
+    (0, '', False, False), (1, '', False, False),
+    (-9, '', False, False), (1, 'ptrace denied\n', True, False),
+])
+def test_ptrace_regression_requires_specific_signed_denial(
+        monkeypatch, regressions, capsys, returncode, output, supervisor_error, passed):
+    receipt = dict(stage='run', returncode=returncode, output=output,
+                   supervisor_error=supervisor_error, output_not_decodable=False,
+                   timeout=False, overflow=False)
+    monkeypatch.setattr(regressions, 'execute', lambda *a, **kw: receipt)
+    if passed:
+        regressions.check_failure(regressions.PTRACE_DENIED)
+        assert json.loads(capsys.readouterr().out)['flags']['incorrect']
+    else:
+        with pytest.raises(AssertionError):
+            regressions.check_failure(regressions.PTRACE_DENIED)

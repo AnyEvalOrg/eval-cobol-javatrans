@@ -49,12 +49,14 @@ def test_operator_checks_all_receipts_and_pod_usability(monkeypatch, capsys, fai
                 body = dict(cwd='/tmp/cjt-fixture', stage='run',
                             returncode={'invalid_bytes': 1, 'fork_exhaustion': 1,
                                         'aggregate_memory': -9, 'disk': -9,
-                                        'detached_child': 0}[current],
+                                        'detached_child': 0, 'unlinked_files': -9, 'memfd_files': -9,
+                                        'empty_files': -9, 'shm_write': 1, 'ptrace_denied': 1}[current],
                             timeout=False, overflow=False, cleanup_failed=False,
                             supervisor_error=False, memory_exceeded=current == 'aggregate_memory',
-                            disk_exceeded=current == 'disk',
+                            disk_exceeded=current in regressions.DISK_CASES,
                             output=base64.b64encode(b'\xff' if current == 'invalid_bytes' else
-                                                  b'20\n' if current == 'fork_exhaustion' else b'').decode())
+                                                  b'20\n' if current == 'fork_exhaustion' else
+                                                  b'ptrace denied\n' if current == 'ptrace_denied' else b'').decode())
                 if failure == 'wrong_flags':
                     body['timeout'] = True
                 body = json.dumps(body)
@@ -86,7 +88,7 @@ def test_operator_checks_all_receipts_and_pod_usability(monkeypatch, capsys, fai
     assert summary == state.metadata['regression_flags']
     assert all(type(flag) is bool for flags in summary.values() for flag in flags.values())
     assert key.hex() not in json.dumps(summary) and 'PRIVATE_' not in json.dumps(summary)
-    assert len(summary) == (1 if failure in ('cleanup', 'pod') else 5)
+    assert len(summary) == (1 if failure in ('cleanup', 'pod') else len(regressions.CASES))
     for command, kwargs in calls:
         assert command[:4] == ['timeout', '-s', 'KILL', '40s' if regressions.RUNNER in command else '5s']
         assert kwargs['timeout_retry'] is False
@@ -109,3 +111,14 @@ def test_fork_receipt_accepts_gvisor_rss_limit(memory, code, output, expected):
     receipt = dict(stage='run', returncode=code, output=output,
                    output_not_decodable=False, memory_exceeded=memory)
     assert regressions.expected_receipt('fork_exhaustion', receipt) is expected
+
+
+@pytest.mark.parametrize('returncode,output,supervisor_error,expected', [
+    (1, 'ptrace denied\n', False, True),
+    (0, '', False, False), (1, '', False, False),
+    (-9, '', False, False), (1, 'ptrace denied\n', True, False),
+])
+def test_ptrace_denial_requires_permission_error_evidence(returncode, output, supervisor_error, expected):
+    receipt = dict(stage='run', returncode=returncode, output=output,
+                   supervisor_error=supervisor_error, output_not_decodable=False)
+    assert regressions.expected_receipt('ptrace_denied', receipt) is expected

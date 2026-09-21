@@ -13,6 +13,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'cobol_javatrans'))
@@ -30,6 +31,7 @@ ASSERTION_LABELS = frozenset({
     'root-linux', 'docker-image-required', 'docker-info', 'docker-child-success',
     'docker-child-stage', 'docker-child-incorrect', 'docker-child-budget',
     'docker-child-returncode', 'cleanup-directory', 'aggregate-memory', 'disk-limit',
+    'receipt-deadline', 'pod-usable', 'shm-read-only', 'ptrace-denied',
 })
 
 
@@ -98,6 +100,55 @@ for i in itertools.count():
     with open(os.path.join(other, str(i)), 'wb') as f:
         f.write(block)
 """
+
+
+def retained_files(memfd=False):
+    # 300 one-MiB files total; 75 descriptors per worker stays below NOFILE=256.
+    create = ("fd = os.memfd_create('retained')" if memfd else
+              "path = os.path.join(other, str(i)); fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600); os.unlink(path)")
+    return f"""import os, tempfile, time
+block = b'x' * 1024**2
+for worker in range(4):
+    if os.fork() == 0:
+        os.setsid()
+        other = tempfile.mkdtemp(prefix='cjt-retained-', dir='/tmp')
+        descriptors = []
+        for i in range(75):
+            {create}
+            descriptors.append(fd)
+            remaining = block
+            while remaining:
+                remaining = remaining[os.write(fd, remaining):]
+            time.sleep(0.005)
+        time.sleep(60)
+        os._exit(0)
+time.sleep(60)
+"""
+
+
+UNLINKED_FILES = retained_files()
+MEMFD_FILES = retained_files(memfd=True)
+EMPTY_FILES = """import time
+for i in range(50000):
+    open(str(i), 'w').close()
+time.sleep(60)
+"""
+# Verify PermissionError specifically, not an unrelated nonzero exit. Also
+# check the actual supervisor: PID 1 may be the container init/sleep process.
+PTRACE_DENIED = """import os
+for path in ('/proc/1/fd/0', f'/proc/{os.getppid()}/fd/0'):
+    try:
+        os.stat(path)
+    except PermissionError:
+        continue
+    else:
+        raise SystemExit(0)
+print('ptrace denied')
+raise SystemExit(1)
+"""
+SHM_WRITE = "open('/dev/shm/cjt-write', 'wb').write(b'x')"
+DISK_CASES = {'disk': DISK_EXHAUSTION, 'unlinked_files': UNLINKED_FILES,
+              'memfd_files': MEMFD_FILES, 'empty_files': EMPTY_FILES}
 DETACHED_CHILD = """import os, time
 if os.fork() == 0:
     os.setsid()
@@ -109,8 +160,8 @@ while not os.path.exists('ready'):
 """
 
 
-def invoke(command, **kwargs):
-    return subprocess.run(command, capture_output=True, text=True, timeout=50, **kwargs)
+def invoke(command, *, timeout=50, **kwargs):
+    return subprocess.run(command, capture_output=True, text=True, timeout=timeout, **kwargs)
 
 
 def independent_cleanup():
@@ -136,13 +187,16 @@ def execute(request, *, budget=False):
             # limit clamping and MemoryError; unlike Docker it cannot attest OOM.
             command = ['prlimit', '--as=536870912:536870912',
                        '--data=536870912:536870912', '--'] + command
+        started = time.monotonic()
         result = invoke(command)
+        assert time.monotonic() - started < 40, 'receipt-deadline'
         receipt = verify_receipt(result.stdout, bytes.fromhex(setup['key']))
         assert receipt is not None, 'authenticated-receipt'
         assert receipt['cwd'] == setup['cwd'], 'receipt-cwd'
         return receipt
     finally:
         independent_cleanup()
+        assert invoke(QUIESCENCE_CHECK_COMMAND).returncode == 0, 'pod-usable'
 
 
 def request_for(code):
@@ -166,6 +220,9 @@ def check_failure(code, *, budget=False, **flags):
     assert not any(receipt.get(key) for key in ('timeout', 'overflow', 'cleanup_failed', 'supervisor_error')), 'failure-flags'
     if code == INVALID_BYTES:
         assert receipt['output_not_decodable'], 'invalid-bytes-detected'
+    elif code == PTRACE_DENIED:
+        assert receipt['returncode'] == 1 and receipt['output'] == 'ptrace denied\n', 'ptrace-denied'
+        assert not any(receipt.get(k) for k in FLAGS), 'failure-flags'
     elif code == FORK_EXHAUSTION:
         assert receipt.get('memory_exceeded') or (receipt['returncode'] == 1 and
             0 < int(receipt['output'].strip()) < 64), 'fork-count'
@@ -207,15 +264,27 @@ def main():
         with check('memory:docker-child'):
             receipt = execute(request_for(AGGREGATE_MEMORY))
             assert receipt.get('memory_exceeded') and receipt_failure(receipt), 'aggregate-memory'
-            report(receipt, incorrect=True, docker_memory_budget=True)
-        with check('disk:docker-child'):
-            receipt = execute(request_for(DISK_EXHAUSTION))
-            assert receipt.get('disk_exceeded') and receipt['returncode'] != 0, 'disk-limit'
-            assert receipt_failure(receipt) == 'disk limit exceeded', 'failure-classified'
-            assert not any(receipt.get(k) for k in FLAGS if k != 'disk_exceeded'), 'failure-flags'
-            report(receipt, incorrect=True)
+            report(receipt, incorrect=True, docker_memory_budget=True,
+                   pod_usable=True, receipt_within_deadline=True)
+        for name, code in DISK_CASES.items():
+            with check(name + ':docker-child'):
+                receipt = execute(request_for(code))
+                assert receipt.get('disk_exceeded') and receipt['returncode'] != 0, 'disk-limit'
+                assert receipt['stage'] == 'run', 'failure-stage'
+                assert receipt_failure(receipt) == 'disk limit exceeded', 'failure-classified'
+                assert not any(receipt.get(k) for k in FLAGS if k != 'disk_exceeded'), 'failure-flags'
+                report(receipt, incorrect=True, pod_usable=True, receipt_within_deadline=True)
+        with check('shm_write:docker-child'):
+            receipt = execute(request_for(SHM_WRITE))
+            assert receipt['stage'] == 'run' and receipt['returncode'] == 1, 'shm-read-only'
+            assert not any(receipt.get(k) for k in FLAGS), 'failure-flags'
+            report(receipt, incorrect=True, pod_usable=True, receipt_within_deadline=True)
+        with check('ptrace_denied:docker-child'):
+            check_failure(PTRACE_DENIED, pod_usable=True, receipt_within_deadline=True)
         return
     compiler_smokes()
+    with check('ptrace_denied'):
+        check_failure(PTRACE_DENIED)
     with check('invalid_bytes'):
         check_failure(INVALID_BYTES, invalid_bytes=True)
     with check('fork_exhaustion'):
@@ -242,22 +311,27 @@ def docker_memory_check(docker, image):
         result = invoke([
             docker, 'run', '--rm', '--init', '--name', name, '--network=none',
             '--memory=2g', '--memory-swap=2g', '--pids-limit=128', '--cpus=1',
-            '--read-only', '--volume', '/tmp', '--shm-size=16m',
+            '--read-only', '--volume', '/tmp', '--tmpfs', '/dev/shm:ro,size=16m',
             '--cap-drop=ALL', '--cap-add=SETUID', '--cap-add=SETGID', '--cap-add=KILL',
-            '--cap-add=CHOWN', '--cap-add=DAC_OVERRIDE', '--security-opt=no-new-privileges',
+            '--cap-add=CHOWN', '--cap-add=DAC_OVERRIDE', '--cap-add=SYS_PTRACE', '--security-opt=no-new-privileges',
             '--user=0:0', '-v', f'{ROOT}:{ROOT}:ro', '--entrypoint', PYTHON,
             image, str(Path(__file__).resolve()), '--memory-child',
-        ])
+        ], timeout=300)
         assert result.returncode == 0, 'docker-child-success'
         # Parse and whitelist the child's summary; never forward raw stdout.
         summaries = [json.loads(line) for line in result.stdout.splitlines()]
-        assert len(summaries) == 2, 'docker-child-success'
-        for summary, expected in zip(summaries, ('memory_exceeded', 'disk_exceeded')):
+        assert len(summaries) == 3 + len(DISK_CASES), 'docker-child-success'
+        for summary, expected in zip(summaries, ('memory_exceeded',) + ('disk_exceeded',) * len(DISK_CASES) + (None, None)):
             assert summary['stage'] == 'run', 'docker-child-stage'
             assert summary['flags']['incorrect'] is True, 'docker-child-incorrect'
-            assert summary['flags'][expected] is True, 'docker-child-budget'
+            if expected:
+                assert summary['flags'][expected] is True, 'docker-child-budget'
+            else:
+                assert not any(summary['flags'].get(k) for k in FLAGS), 'failure-flags'
             assert summary['returncode'] != 0, 'docker-child-returncode'
-            report({**summary, **summary['flags']}, incorrect=True, **{expected: True})
+            report({**summary, **summary['flags']}, incorrect=True,
+                   pod_usable=summary['flags'].get('pod_usable', False),
+                   receipt_within_deadline=summary['flags'].get('receipt_within_deadline', False))
 
     finally:
         invoke([docker, 'rm', '-f', '-v', name])

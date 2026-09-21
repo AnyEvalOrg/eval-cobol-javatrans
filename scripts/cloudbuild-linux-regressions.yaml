@@ -12,8 +12,9 @@ steps:
         cp "$$(command -v docker)" /workspace/.linux-regressions/docker
         docker pull '${_IMAGE}'
         docker run --rm --init --network=none --memory=2g --memory-swap=2g --pids-limit=128 --cpus=1 \
+          --read-only --volume /tmp --tmpfs /dev/shm:ro,size=16m \
           --cap-drop=ALL --cap-add=SETUID --cap-add=SETGID --cap-add=KILL \
-          --cap-add=CHOWN --cap-add=DAC_OVERRIDE --security-opt=no-new-privileges --user=0:0 \
+          --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=SYS_PTRACE --security-opt=no-new-privileges --user=0:0 \
           -v /workspace:/workspace:ro -v /var/run/docker.sock:/var/run/docker.sock \
           -e DOCKER_HOST=unix:///var/run/docker.sock --entrypoint /usr/local/bin/python3 \
           '${_IMAGE}' /workspace/scripts/linux_regressions.py \

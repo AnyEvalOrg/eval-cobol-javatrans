@@ -59,16 +59,112 @@ DIRECTORY_CLEANUP_COMMAND = [
 # Same definition of live processes, without killing an unexpectedly occupied UID.
 QUIESCENCE_CHECK_COMMAND = QUIESCENCE_COMMAND + ["--check-only"]
 
+# Shared verbatim by the setup probe and every candidate launch.
+CHILD_RESTRICTIONS = r'''
+def candidate_limits(java=False):
+    # Leave process slots for the root supervisor and independent cleanup execs.
+    # Clamp to inherited budgets as well (the Linux regression uses prlimit).
+    # The RSS watchdog bounds aggregate memory, including Java reservations
+    # that become resident. Keep independent per-process native limits too.
+    memory = 8 * 1024**3 if java else 1024**3
+    for kind, value in ((resource.RLIMIT_NPROC, 64),
+                        (resource.RLIMIT_NOFILE, 1024 if java else 256),
+                        (resource.RLIMIT_AS, memory),
+                        (resource.RLIMIT_DATA, memory),
+                        (resource.RLIMIT_FSIZE, limit),
+                        (resource.RLIMIT_CORE, 0)):
+        hard = resource.getrlimit(kind)[1]
+        if hard != resource.RLIM_INFINITY:
+            value = min(value, hard)
+        resource.setrlimit(kind, (value, value))
+
+
+def restrict_child(java=False):
+    # Still root in the supervisor's preexec child: set this BEFORE exec/drop so
+    # even immediate allocations and all descendants inherit the OOM preference.
+    with open("/proc/self/oom_score_adj", "w") as f:
+        f.write("1000")
+    # No parent-death signal is trusted: the scorer independently kills this UID.
+    if libc.prctl(38, 1, 0, 0, 0) != 0:  # PR_SET_NO_NEW_PRIVS
+        os._exit(125)
+    if libc.prctl(8, 0, 0, 0, 0) != 0:  # PR_SET_KEEPCAPS = 0
+        os._exit(125)
+    os.setgroups([])
+    os.setresgid(CANDIDATE_GID, CANDIDATE_GID, CANDIDATE_GID)
+    os.setresuid(CANDIDATE_UID, CANDIDATE_UID, CANDIDATE_UID)
+    # Set NPROC AFTER changing UID, avoiding execve's PF_NPROC_EXCEEDED trap.
+    # These hard limits and the irreversible credential drop survive exec.
+    candidate_limits(java)
+'''
+
 # Setup runs before any candidate exists. Both execs are bounded by the scorer.
 SETUP = r'''
-import json, os, secrets, sys, tempfile
-request = json.load(sys.stdin)
-key = secrets.token_hex(32)
-request["key"] = key
-work = tempfile.mkdtemp(prefix="cjt-", dir="/tmp")
-with open(os.path.join(work, "request.json"), "x", encoding="utf-8") as f:
-    json.dump(request, f)
-sys.stdout.write(json.dumps({"cwd": work, "key": key}))
+import ctypes, json, os, resource, secrets, shutil, subprocess, sys, tempfile
+CANDIDATE_UID = 65532
+CANDIDATE_GID = 65532
+libc = ctypes.CDLL(None, use_errno=True)
+limit = 4096
+''' + CHILD_RESTRICTIONS + r'''
+
+
+def check_prerequisites(work):
+    # Test the actual cross-UID procfs access needed by both watchdogs. This
+    # catches missing SYS_PTRACE before candidate failures can become verdicts.
+    if os.getuid() != 0 or libc.prctl(4, 0, 0, 0, 0) != 0:
+        raise RuntimeError()
+    os.listdir("/proc")
+    with open("/proc/self/oom_score_adj", "r+") as f:
+        value = f.read()
+        f.seek(0)
+        f.write(value)
+    probe = os.path.join(work, "probe")
+    os.mkdir(probe, 0o700)
+    os.chown(probe, CANDIDATE_UID, CANDIDATE_GID)
+    os.chmod(work, 0o711)
+    child = None
+    try:
+        script = os.path.join(probe, "check")
+        with open(script, "x", encoding="utf-8") as f:
+            f.write("#!/bin/sh\nset -e\nprintf ready > writable\n")
+        os.chmod(script, 0o755)
+        child = subprocess.Popen(
+            [sys.executable, "-I", "-c", "import time; time.sleep(2)"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True, preexec_fn=restrict_child)
+        os.stat("/proc/" + str(child.pid) + "/fd/0")
+        with open("/proc/" + str(child.pid) + "/status") as f:
+            status = dict(line.split(":", 1) for line in f if ":" in line)
+        if (status["Uid"].split() != [str(CANDIDATE_UID)] * 4
+                or int(status["VmRSS"].split()[0]) < 0):
+            raise RuntimeError()
+        # Execute on the actual work mount as the candidate UID. The script
+        # also writes there, checking both permissions and noexec restrictions.
+        subprocess.run([script], cwd=probe, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       close_fds=True, preexec_fn=restrict_child, timeout=1, check=True)
+        with open(os.path.join(probe, "writable")) as f:
+            if f.read() != "ready":
+                raise RuntimeError()
+    finally:
+        if child is not None:
+            child.kill()
+            child.wait(timeout=1)
+        shutil.rmtree(probe)
+        os.chmod(work, 0o700)
+
+
+try:
+    request = json.load(sys.stdin)
+    work = tempfile.mkdtemp(prefix="cjt-", dir="/tmp")
+    check_prerequisites(work)
+    key = secrets.token_hex(32)
+    request["key"] = key
+    with open(os.path.join(work, "request.json"), "x", encoding="utf-8") as f:
+        json.dump(request, f)
+    sys.stdout.write(json.dumps({"cwd": work, "key": key}))
+except Exception:
+    # Fixed, detail-free failure. No receipt means a withheld HARNESS error.
+    raise SystemExit("Sandbox prerequisites unavailable.") from None
 '''
 
 # Kept as source: importing this module never starts a process or executes code.
@@ -106,42 +202,10 @@ key = bytes.fromhex(request.pop("key"))
 limit = request["output_limit"]
 
 
-JAVA_TOOL_OPTIONS = "-Xmx512m -XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSize=64m -Xss1m"
+JAVA_TOOL_OPTIONS = "-Xmx512m -XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSize=64m -Xss1m -XX:-UsePerfData"
 
 
-def candidate_limits(java=False):
-    # Leave process slots for the root supervisor and independent cleanup execs.
-    # Clamp to inherited budgets as well (the Linux regression uses prlimit).
-    # The RSS watchdog bounds aggregate memory, including Java reservations
-    # that become resident. Keep independent per-process native limits too.
-    memory = 8 * 1024**3 if java else 1024**3
-    for kind, value in ((resource.RLIMIT_NPROC, 64),
-                        (resource.RLIMIT_AS, memory),
-                        (resource.RLIMIT_DATA, memory),
-                        (resource.RLIMIT_FSIZE, limit),
-                        (resource.RLIMIT_CORE, 0)):
-        hard = resource.getrlimit(kind)[1]
-        if hard != resource.RLIM_INFINITY:
-            value = min(value, hard)
-        resource.setrlimit(kind, (value, value))
-
-
-def restrict_child(java=False):
-    # Still root in the supervisor's preexec child: set this BEFORE exec/drop so
-    # even immediate allocations and all descendants inherit the OOM preference.
-    with open("/proc/self/oom_score_adj", "w") as f:
-        f.write("1000")
-    # No parent-death signal is trusted: the scorer independently kills this UID.
-    if libc.prctl(38, 1, 0, 0, 0) != 0:  # PR_SET_NO_NEW_PRIVS
-        os._exit(125)
-    if libc.prctl(8, 0, 0, 0, 0) != 0:  # PR_SET_KEEPCAPS = 0
-        os._exit(125)
-    os.setgroups([])
-    os.setresgid(CANDIDATE_GID, CANDIDATE_GID, CANDIDATE_GID)
-    os.setresuid(CANDIDATE_UID, CANDIDATE_UID, CANDIDATE_UID)
-    # Set NPROC AFTER changing UID, avoiding execve's PF_NPROC_EXCEEDED trap.
-    # These hard limits and the irreversible credential drop survive exec.
-    candidate_limits(java)
+''' + CHILD_RESTRICTIONS + r'''
 
 
 def kill_group(pgid):
@@ -160,6 +224,7 @@ def kill_group(pgid):
 AGGREGATE_MEMORY = 768 * 1024**2
 WATCHDOG_INTERVAL = 0.05
 AGGREGATE_DISK = 256 * 1024**2
+DISK_ENTRY_LIMIT = 10000
 DISK_WATCHDOG_INTERVAL = 0.1
 
 
@@ -175,7 +240,7 @@ def candidate_processes():
                 status = dict(line.split(":", 1) for line in f if ":" in line)
             if status["Uid"].split()[0] == str(CANDIDATE_UID):
                 yield int(name), int(status.get("VmRSS", "0 kB").split()[0]) * 1024
-        except (FileNotFoundError, ProcessLookupError):
+        except (PermissionError, FileNotFoundError, ProcessLookupError):
             pass
 
 
@@ -209,44 +274,89 @@ def memory_watchdog(pgid, stopped, status):
         kill_candidate(pgid)
 
 
-def disk_usage(roots=("/tmp", "/dev/shm")):
+def disk_usage(roots=("/tmp", "/var/tmp", "/dev/shm"), stopped=None):
     # Use directory descriptors so a concurrent rename/symlink replacement
     # cannot redirect traversal outside the mounts. Never open candidate file
     # contents or FIFOs/devices; count allocated blocks, not apparent size.
-    races = (errno.ENOENT, errno.ENOTDIR, errno.ELOOP)
+    # Check every entry (N=1), including empty files. Descriptor scans share the
+    # inode set so hard links, inherited/duplicated fds and visible files count once.
+    races = (errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.ESRCH, errno.EACCES, errno.EPERM)
+    total = 0
+    count = 0
+    seen = set()
+
+    def done():
+        return total > AGGREGATE_DISK or (stopped is not None and stopped.is_set())
+
+    def account(info):
+        nonlocal total
+        inode = (info.st_dev, info.st_ino)
+        if stat.S_ISREG(info.st_mode) and inode not in seen:
+            seen.add(inode)
+            total += info.st_blocks * 512
 
     def walk(path, parent=None):
+        nonlocal total, count
+        if done():
+            return
         try:
             fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                          dir_fd=parent)
         except OSError as exc:
-            if exc.errno in races:
-                return 0
+            if isinstance(exc, (PermissionError, FileNotFoundError, ProcessLookupError)) or exc.errno in races:
+                return
             raise
         try:
-            total = 0
             with os.scandir(fd) as entries:
                 for entry in entries:
+                    if done():
+                        return
+                    count += 1
+                    if count > DISK_ENTRY_LIMIT:
+                        total = max(total, AGGREGATE_DISK + 1)
+                        return
                     try:
                         info = entry.stat(follow_symlinks=False)
-                        if stat.S_ISREG(info.st_mode):
-                            total += info.st_blocks * 512
-                        elif stat.S_ISDIR(info.st_mode):
-                            total += walk(entry.name, fd)
+                        account(info)
+                        if stat.S_ISDIR(info.st_mode):
+                            walk(entry.name, fd)
                     except OSError as exc:
-                        if exc.errno not in races:
+                        if not isinstance(exc, (PermissionError, FileNotFoundError, ProcessLookupError)) and exc.errno not in races:
                             raise
-            return total
+        except (PermissionError, FileNotFoundError, ProcessLookupError):
+            pass
         finally:
             os.close(fd)
 
-    return sum(walk(root) for root in roots)
+    for root in roots:
+        walk(root)
+    if done():
+        return total
+    # os.stat follows procfs magic links even after unlink, including memfds.
+    # UID selection includes detached descendants; NOFILE/NPROC bound fd work.
+    for pid, _ in candidate_processes():
+        if done():
+            break
+        try:
+            with os.scandir("/proc/" + str(pid) + "/fd") as descriptors:
+                for entry in descriptors:
+                    if done():
+                        return total
+                    try:
+                        account(os.stat(entry.path))
+                    except OSError as exc:
+                        if not isinstance(exc, (PermissionError, FileNotFoundError, ProcessLookupError)) and exc.errno not in races:
+                            raise
+        except OSError as exc:
+            if not isinstance(exc, (PermissionError, FileNotFoundError, ProcessLookupError)) and exc.errno not in races:
+                raise
+    return total
 
 
 def disk_watchdog(pgid, stopped, status):
     try:
         while not stopped.is_set():
-            if disk_usage() > AGGREGATE_DISK:
+            if disk_usage(stopped=stopped) > AGGREGATE_DISK:
                 status["disk_exceeded"] = True
                 kill_candidate(pgid)
                 return
@@ -341,7 +451,12 @@ def run_step(argv, timeout, candidate_work):
                         status["cleanup_failed"] = True
                 stopped.set()
                 for watcher in watchers:
-                    watcher.join()
+                    watcher.join(timeout=0.2)
+                    if watcher.is_alive():
+                        # Never fork the next stage with a stuck scanner thread.
+                        # Signing cannot wait for filesystem work; os._exit ends
+                        # daemon threads after the authenticated failure is flushed.
+                        status["supervisor_error"] = True
             stdout.seek(0)
             output = stdout.read(limit + 1)
             status["overflow"] = len(output) >= limit or os.fstat(stderr.fileno()).st_size >= limit
