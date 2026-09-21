@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import pytest
 from cobol_javatrans.sandbox_runner import SETUP, RUNNER, CLEANUP_COMMAND, QUIESCENCE_COMMAND
 from cobol_javatrans.scoring import verify_receipt
@@ -42,8 +43,8 @@ def run_fixture(compile_code='pass', run_code="print('ok')", timeout=1, output_f
         source = source.replace('os.chown(candidate_work, CANDIDATE_UID, CANDIDATE_GID)', 'pass')
         source = source.replace('info.st_uid != CANDIDATE_UID', 'info.st_uid != os.getuid()')
         source = source.replace('os.killpg(pgid, sig)', 'os.kill(pgid, sig)')
-        start, end = source.index('def sweep_uid():'), source.index('def run_step(')
-        source = source[:start] + 'def sweep_uid():\n    pass\n\n\n' + source[end:]
+        start, end = source.index('def memory_watchdog('), source.index('def run_step(')
+        source = source[:start] + 'def memory_watchdog(*args):\n    pass\n\ndef disk_watchdog(*args):\n    pass\n\ndef sweep_uid():\n    pass\n\n\n' + source[end:]
     if transform:
         source = transform(source)
     try:
@@ -55,7 +56,7 @@ def run_fixture(compile_code='pass', run_code="print('ok')", timeout=1, output_f
             receipt = verify_receipt(published.read().decode(), bytes.fromhex(setup['key']))
         assert receipt is not None
         if not transform:
-            assert not Path(setup['cwd']).exists()
+            assert Path(setup['cwd']).exists()
         return receipt
     finally:
         shutil.rmtree(setup['cwd'], ignore_errors=True)
@@ -254,25 +255,10 @@ def test_invalid_utf8_retains_authenticated_receipt(output_file):
     assert receipt_failure(receipt) == 'output not decodable.'
 
 
-@pytest.mark.parametrize('failed_step', ['kill_group', 'sweep_uid', 'read', 'rmtree'])
+@pytest.mark.parametrize('failed_step', ['kill_group', 'sweep_uid', 'read'])
 def test_post_exit_exceptions_cannot_erase_receipt(failed_step):
     def transform(source):
-        if failed_step == 'rmtree':
-            # Simulate cleanup trying to spawn with no slots. At that instant,
-            # the actual stdout fd must already contain a signed, flushed receipt.
-            source = source.replace('    try:\n        shutil.rmtree', '''    def failed_spawn(*args, **kwargs):
-        try:
-            published = json.loads(os.pread(1, 65536, 0))
-            assert hmac.compare_digest(published["tag"],
-                hmac.new(key, published["body"].encode(), hashlib.sha256).hexdigest())
-        except Exception:
-            raise SystemExit(99)
-        raise OSError("no process slots")
-    subprocess.run = failed_spawn
-    try:
-        subprocess.run(["cleanup"])
-        shutil.rmtree''')
-        elif failed_step == 'read':
+        if failed_step == 'read':
             source = source.replace('output = stdout.read(limit + 1)', 'raise OSError("read failed")')
         else:
             name = 'def ' + failed_step + '('
@@ -304,7 +290,7 @@ def test_actual_candidate_limits_function(java, inherited):
     ns = {'resource': fake, 'limit': 4096}
     exec(compile(ast.Module(body=[fn], type_ignores=[]), '<limits>', 'exec'), ns)
     ns['candidate_limits'](java)
-    memory = inherited or (8 * 1024**3 if java else 1536 * 1024**2)
+    memory = inherited or (8 * 1024**3 if java else 1024**3)
     assert limits == {resource.RLIMIT_NPROC: (64, 64), resource.RLIMIT_AS: (memory, memory),
                       resource.RLIMIT_DATA: (memory, memory), resource.RLIMIT_FSIZE: (4096, 4096),
                       resource.RLIMIT_CORE: (0, 0)}
@@ -333,7 +319,7 @@ def test_step_applies_jvm_environment_and_matching_preexec_limits(tmp_path, exec
     nodes = [n for n in tree.body if
              (isinstance(n, ast.FunctionDef) and n.name == 'run_step') or
              (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'JAVA_TOOL_OPTIONS' for t in n.targets))]
-    ns = dict(os=os, tempfile=tempfile, work=str(tmp_path), limit=4096,
+    ns = dict(os=os, tempfile=tempfile, threading=threading, memory_watchdog=lambda *args: None, disk_watchdog=lambda *args: None, work=str(tmp_path), limit=4096,
               subprocess=SimpleNamespace(Popen=popen, DEVNULL=subprocess.DEVNULL, TimeoutExpired=subprocess.TimeoutExpired),
               restrict_child=modes.append, kill_group=lambda pid: None, sweep_uid=lambda: None)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), '<step>', 'exec'), ns)
@@ -345,3 +331,173 @@ def test_step_applies_jvm_environment_and_matching_preexec_limits(tmp_path, exec
         assert env['JAVA_TOOL_OPTIONS'] == '-Xmx512m -XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSize=64m -Xss1m'
     else:
         assert 'JAVA_TOOL_OPTIONS' not in env
+
+
+@pytest.mark.parametrize('rss_kib, trips', [(768 * 1024, False), (768 * 1024 + 1, True)])
+def test_memory_watchdog_aggregate_proc_data(monkeypatch, rss_kib, trips):
+    import io
+    import signal
+    from types import SimpleNamespace
+    calls = []
+    statuses = {
+        '/proc/1/status': 'Uid: 0 0 0 0\nVmRSS: 9999999 kB\n',
+        '/proc/2/status': f'Uid: 65532 65532 65532 65532\nVmRSS: {rss_kib // 2} kB\n',
+        '/proc/3/status': f'Uid: 65532 65532 65532 65532\nVmRSS: {rss_kib - rss_kib // 2} kB\n',
+        '/proc/4/status': 'Uid: 65532 65532 65532 65532\nState: Z\n',
+    }
+    def read(path):
+        if path not in statuses:
+            raise FileNotFoundError(path)
+        return io.StringIO(statuses[path])
+    fake_os = SimpleNamespace(listdir=lambda p: ['1', '2', '3', '4', '5', 'self'],
+                              killpg=lambda *a: calls.append(('group', *a)),
+                              kill=lambda *a: calls.append(('pid', *a)))
+    class Stop:
+        done = False
+        def is_set(self): return self.done
+        def wait(self, interval):
+            assert interval == 0.05
+            self.done = True
+    nodes = [n for n in ast.parse(RUNNER).body if isinstance(n, ast.FunctionDef)
+             and n.name in ('candidate_processes', 'memory_watchdog', 'kill_candidate')]
+    ns = dict(os=fake_os, open=read, signal=signal, CANDIDATE_UID=65532,
+              AGGREGATE_MEMORY=768 * 1024**2, WATCHDOG_INTERVAL=0.05)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), '<watchdog>', 'exec'), ns)
+    status = {'memory_exceeded': False, 'supervisor_error': False}
+    ns['memory_watchdog'](2, Stop(), status)
+    assert status == {'memory_exceeded': trips, 'supervisor_error': False}
+    assert calls == ([('group', 2, signal.SIGKILL)] +
+                     [('pid', p, signal.SIGKILL) for p in (2, 3, 4)] if trips else [])
+
+
+@pytest.mark.parametrize('hang', [False, True])
+def test_receipt_complete_without_attempting_directory_deletion(hang):
+    def transform(source):
+        # A deletion would either terminate with no receipt or hang past the
+        # fixture deadline. Both must be unreachable in the supervisor process.
+        injection = """
+import shutil
+def forbidden_delete(*args, **kwargs):
+    if HANG:
+        while True: time.sleep(1)
+    os._exit(99)
+shutil.rmtree = forbidden_delete
+""".replace('HANG', repr(hang))
+        return source.replace('work = sys.argv[1]', injection + '\nwork = sys.argv[1]')
+    receipt = run_fixture(transform=transform)
+    assert receipt['returncode'] == 0 and receipt['output'] == 'ok\n'
+    tree = ast.parse(RUNNER)
+    final = tree.body[-1].finalbody
+    assert ast.unparse(final[-2]) == 'sys.stdout.flush()'
+    assert ast.unparse(final[-1]) == 'os._exit(0)'
+    assert 'rmtree' not in RUNNER
+
+
+@pytest.mark.parametrize('watchdog,flag', [('memory_watchdog', 'memory_exceeded'),
+                                          ('disk_watchdog', 'disk_exceeded')])
+def test_watchdog_flag_is_signed_and_blocks_next_stage(watchdog, flag):
+    def transform(source):
+        return source.replace(f'def {watchdog}(*args):\n    pass',
+                              f'def {watchdog}(pgid, stopped, status):\n    status[{flag!r}] = True')
+    receipt = run_fixture(run_code="print('MUST_NOT_RUN')", transform=transform)
+    assert receipt['stage'] == 'compile'
+    assert receipt[flag] is True
+    assert receipt['output'] == ''
+
+
+@pytest.mark.parametrize('trips', [False, True])
+def test_disk_watchdog_counts_allocated_blocks_across_trees(tmp_path, trips):
+    import errno
+    import signal
+    import stat
+    roots = [tmp_path / 'tmp', tmp_path / 'shm']
+    work = roots[0] / 'cjt-work' / 'candidate'
+    sibling = roots[0] / 'cjt-other'
+    for directory in (work, sibling, roots[1]):
+        directory.mkdir(parents=True)
+        (directory / 'data').write_bytes(os.urandom(8192))
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    (outside / 'ignored').write_bytes(os.urandom(8192))
+    (work / 'file-link').symlink_to(outside / 'ignored')
+    (sibling / 'dir-link').symlink_to(outside, target_is_directory=True)
+    (sibling / 'loop').symlink_to(roots[0], target_is_directory=True)
+    os.mkfifo(work / 'fifo')
+    with (work / 'sparse').open('wb') as stream:
+        stream.truncate(1024**3)
+    expected = sum(p.stat().st_blocks * 512 for p in
+                   (work / 'data', sibling / 'data', roots[1] / 'data', work / 'sparse'))
+    nodes = [n for n in ast.parse(RUNNER).body if isinstance(n, ast.FunctionDef)
+             and n.name in ('disk_usage', 'disk_watchdog', 'kill_candidate')]
+    calls = []
+    class Stop:
+        done = False
+        def is_set(self): return self.done
+        def wait(self, interval):
+            assert interval == 0.1
+            self.done = True
+    ns = dict(os=os, stat=stat, errno=errno, signal=signal,
+              AGGREGATE_DISK=expected - int(trips), DISK_WATCHDOG_INTERVAL=0.1,
+              candidate_processes=lambda: [(124, 0)])
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), '<disk-watchdog>', 'exec'), ns)
+    usage = ns['disk_usage']
+    assert usage(roots) == expected
+    assert usage([tmp_path / 'missing', work / 'data', sibling / 'dir-link']) == 0
+    ns['disk_usage'] = lambda: usage(roots)
+    # Exercise the shared kill path, without signaling any real processes.
+    from types import SimpleNamespace
+    ns['os'] = SimpleNamespace(**{name: getattr(os, name) for name in
+        ('open', 'close', 'scandir', 'O_RDONLY', 'O_DIRECTORY', 'O_NOFOLLOW')},
+        killpg=lambda *args: calls.append(('group', *args)),
+        kill=lambda *args: calls.append(('pid', *args)))
+    status = dict(disk_exceeded=False, supervisor_error=False)
+    ns['disk_watchdog'](123, Stop(), status)
+    assert status == dict(disk_exceeded=trips, supervisor_error=False)
+    assert calls == ([('group', 123, signal.SIGKILL), ('pid', 124, signal.SIGKILL)] if trips else [])
+
+
+def test_disk_watchdog_fails_closed_on_scan_error():
+    from types import SimpleNamespace
+    nodes = [n for n in ast.parse(RUNNER).body if isinstance(n, ast.FunctionDef)
+             and n.name == 'disk_watchdog']
+    def broken_scan():
+        raise PermissionError('scan failed')
+    killed = []
+    ns = dict(disk_usage=broken_scan, kill_candidate=killed.append)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), '<disk-watchdog>', 'exec'), ns)
+    status = dict(disk_exceeded=False, supervisor_error=False)
+    ns['disk_watchdog'](123, SimpleNamespace(is_set=lambda: False), status)
+    assert status == dict(disk_exceeded=False, supervisor_error=True)
+    assert killed == [123]
+
+
+@pytest.mark.parametrize('replacement', ['deleted', 'symlink'])
+def test_disk_walk_tolerates_directory_replacement_without_following(tmp_path, replacement):
+    import errno
+    import stat
+    from types import SimpleNamespace
+    root = tmp_path / 'root'
+    root.mkdir()
+    moving = root / 'moving'
+    moving.mkdir()
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    (outside / 'ignored').write_bytes(os.urandom(8192))
+    stable = root / 'stable'
+    stable.write_bytes(os.urandom(8192))
+    opened = []
+    def racing_open(path, flags, **kwargs):
+        if path == 'moving':
+            opened.append(path)
+            moving.rmdir()
+            if replacement == 'symlink':
+                moving.symlink_to(outside, target_is_directory=True)
+        return os.open(path, flags, **kwargs)
+    fake_os = SimpleNamespace(**{name: getattr(os, name) for name in
+        ('close', 'scandir', 'O_RDONLY', 'O_DIRECTORY', 'O_NOFOLLOW')}, open=racing_open)
+    node = next(n for n in ast.parse(RUNNER).body if isinstance(n, ast.FunctionDef)
+                and n.name == 'disk_usage')
+    ns = dict(os=fake_os, stat=stat, errno=errno)
+    exec(compile(ast.Module(body=[node], type_ignores=[]), '<disk-race>', 'exec'), ns)
+    assert ns['disk_usage']([root]) == stable.stat().st_blocks * 512
+    assert opened == ['moving']

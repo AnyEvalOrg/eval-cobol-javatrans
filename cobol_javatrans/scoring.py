@@ -14,7 +14,7 @@ from inspect_ai.util import sandbox
 from .receipt import verify_receipt, receipt_failure
 from .dataset import load_records
 from .publication import private_grading
-from .sandbox_runner import CLEANUP_COMMAND, QUIESCENCE_COMMAND, RUNNER, SETUP
+from .sandbox_runner import CLEANUP_COMMAND, QUIESCENCE_COMMAND, DIRECTORY_CLEANUP_COMMAND, RUNNER, SETUP
 from .execution import execution_request
 from .cleaning import clean_java_response, clean_response_for_eval
 from .comparison import parse, is_equal
@@ -65,6 +65,8 @@ def translation_scorer(direction: str):
             # inside one root supervisor; no candidate-controlled driver verdict.
             deadline = payload['timeout'] + payload['run_timeout'] + 10
             receipt = None
+            failure = None
+            cleanup_failed = False
             cleanup_after = 0
             try:
                 with private_grading(env) as private:
@@ -98,6 +100,11 @@ def translation_scorer(direction: str):
                                 # Authenticated completion means no later spawn;
                                 # sweep immediately before starting the next test.
                                 cleanup_after = 0
+                                # Decide from authenticated evidence BEFORE cleanup.
+                                failure = receipt_failure(receipt)
+                                if (failure is None and direction == 'java_to_cobol'
+                                        and not cobol_matches(receipt['output'], test['result'])):
+                                    failure = "wrong answer."
                             else:
                                 receipt = None
                         except Exception:
@@ -113,6 +120,10 @@ def translation_scorer(direction: str):
                         except asyncio.CancelledError:
                             await cleanup
                             raise
+                        except Exception:
+                            # Pods are per-sample and discarded afterwards: never
+                            # reuse after failed cleanup, but retain signed failure.
+                            cleanup_failed = True
             except Exception:
                 # Provider exceptions may embed stdin or captured output. Do not
                 # allow them (or their exception chain) into an Inspect error event.
@@ -120,11 +131,11 @@ def translation_scorer(direction: str):
             # Neither success nor returncode from the run provider is a verdict channel.
             if receipt is None:
                 raise RuntimeError("Private sandbox operation failed; details withheld.") from None
-            failure = receipt_failure(receipt)
             if failure is not None:
                 return Score(value=INCORRECT, explanation=f"Test {index}: {failure}")
-            if direction == 'java_to_cobol' and not cobol_matches(receipt['output'], test['result']):
-                return Score(value=INCORRECT, explanation=f"Test {index}: wrong answer.")
+            if cleanup_failed:
+                return Score(value=INCORRECT, explanation=
+                             "candidate left processes that could not be cleaned up")
         return Score(value=CORRECT, explanation=f"All {len(tests)} tests passed.")
 
     async def score(state: TaskState, target: Target) -> Score:
@@ -140,7 +151,7 @@ def translation_scorer(direction: str):
 
 
 async def cleanup_candidate(environment, not_before: float = 0) -> None:
-    """Trusted, independent UID sweep; never proceed if cleanup itself fails."""
+    """Bounded independent UID sweep and deletion; caller applies receipt verdict."""
     try:
         delay = not_before - asyncio.get_running_loop().time()
         if delay > 0:
@@ -157,6 +168,12 @@ async def cleanup_candidate(environment, not_before: float = 0) -> None:
             )
         if checked.returncode != 0:
             raise RuntimeError("UID cleanup did not reach quiescence")
+        async with asyncio.timeout(10):
+            deleted = await environment.exec(
+                list(DIRECTORY_CLEANUP_COMMAND), cwd="/", timeout=5, timeout_retry=False,
+            )
+        if deleted.returncode != 0:
+            raise RuntimeError("Directory cleanup failed")
     except Exception:
-        # In particular do not turn a cleanup timeout into a candidate verdict.
+        # The caller preserves signed failures and penalizes signed successes.
         raise RuntimeError("Private sandbox cleanup failed; details withheld.") from None

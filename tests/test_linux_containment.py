@@ -82,7 +82,7 @@ print(pid, flush=True)
         receipt = verify_receipt(result.stdout, bytes.fromhex(setup['key']))
         assert receipt and receipt['returncode'] == 0 and receipt['stage'] == 'run'
         assert not process_running(int(receipt['output']))
-        assert not Path(setup['cwd']).exists()
+        assert Path(setup['cwd']).exists()  # Deletion belongs to independent cleanup.
     finally:
         independent_cleanup()
         shutil.rmtree(setup['cwd'], ignore_errors=True)

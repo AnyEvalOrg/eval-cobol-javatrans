@@ -23,6 +23,7 @@ services:
       runAsGroup: 0
       runAsNonRoot: false
       allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
       capabilities:
         drop: ["ALL"]
         add: ["SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE"]
@@ -30,16 +31,23 @@ services:
         type: RuntimeDefault
     # Equal CPU/memory requests and limits give Guaranteed QoS and reserve the
     # full 2 GiB, avoiding memory overcommit onto the supervisor's node budget.
-    # Native candidate AS/DATA are capped at 1.5 GiB per process. JVM heap,
-    # metaspace/code cache are 512/256/64 MiB (8 GiB AS for virtual reservations).
-    # A single native process leaves 512 MiB for the supervisor/cleanup; the pod
-    # limit also bounds aggregate usage across compiler subprocesses. All
-    # candidates inherit oom_score_adj=1000 to prefer them under residual pressure.
+    # Aggregate UID RSS watchdog: 768 MiB + at most one 50 ms allocation burst
+    # + file cache, /dev/shm and supervisor headroom within 2 GiB.
+    # Native AS/DATA: 1 GiB/process. JVM heap/metaspace/code: 512/256/64 MiB
+    # (8 GiB virtual AS/DATA); all resident candidate memory is watched.
+    # gVisor records oom_score_adj but does not use it: it is NOT containment.
+    # Read-only root; /tmp is DISK-backed emptyDir, sizeLimit 512 MiB is an
+    # eviction backstop, not a synchronous write limit. Pod ephemeral-storage:
+    # 1 GiB. The supervisor watches all regular-file allocated blocks under
+    # /tmp and /dev/shm: 256 MiB + one 100 ms write burst. gVisor gofer write
+    # throughput makes the burst small. Do not rely on tmpfs sizeLimit under
+    # gVisor: Memory emptyDir limits are not enforced as tmpfs mount sizes.
+    # /dev/shm remains Memory emptyDir with sizeLimit 16 MiB; the disk watchdog
+    # includes it. /tmp holds work, compiler scratch, requests and captured streams.
     resources:
       requests:
         cpu: "1"
         memory: 2Gi
-        # Disk-backed /tmp/cjt-* requests, candidate files and captured streams.
         ephemeral-storage: 1Gi
       limits:
         cpu: "1"

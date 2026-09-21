@@ -47,7 +47,7 @@ def test_script_uses_actual_setup_runner_and_authenticated_failure(monkeypatch, 
     monkeypatch.setattr(regressions.shutil, 'rmtree', lambda *args, **kwargs: None)
     regressions.check_failure(regressions.INVALID_BYTES, budget=budget)
     assert calls[0] == regressions.QUIESCENCE_CHECK_COMMAND
-    assert calls[-2:] == [regressions.CLEANUP_COMMAND, regressions.QUIESCENCE_COMMAND]
+    assert calls[-3:] == [regressions.CLEANUP_COMMAND, regressions.QUIESCENCE_COMMAND, regressions.DIRECTORY_CLEANUP_COMMAND]
     summary = json.loads(capsys.readouterr().out)
     assert set(summary) == {'stage', 'returncode', 'flags'}
     assert summary['flags']['incorrect'] and summary['flags']['output_not_decodable']
@@ -132,7 +132,8 @@ def test_preflight_failure_has_label_and_never_starts_setup(monkeypatch, regress
 ])
 def test_cleanup_returncodes(monkeypatch, regressions, kill_status, quiescence_status, label):
     def invoke(command):
-        return SimpleNamespace(returncode=kill_status if command == regressions.CLEANUP_COMMAND else quiescence_status)
+        return SimpleNamespace(returncode=(kill_status if command == regressions.CLEANUP_COMMAND else
+                                         quiescence_status if command == regressions.QUIESCENCE_COMMAND else 0))
 
     monkeypatch.setattr(regressions, 'invoke', invoke)
     if label:
@@ -150,5 +151,58 @@ def test_cloudbuild_provides_reference_image_and_nested_docker_socket():
     assert step['name'] == 'gcr.io/cloud-builders/docker'
     command = step['args'][-1]
     assert '/var/run/docker.sock:/var/run/docker.sock' in command
+    assert 'cp "$$(command -v docker)" /workspace/.linux-regressions/docker' in command
+    assert '--docker-cli /workspace/.linux-regressions/docker' in command
     assert '--image' in command and '${_IMAGE}' in command
     assert '/workspace/scripts/linux_regressions.py' in command
+
+
+def test_docker_uses_aggregate_memory_and_disk_budgets(monkeypatch, regressions, capsys):
+    calls = []
+    summaries = [
+        dict(stage='run', returncode=-9, flags=dict(incorrect=True, memory_exceeded=True)),
+        dict(stage='run', returncode=-9, flags=dict(incorrect=True, disk_exceeded=True)),
+    ]
+    def invoke(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout='\n'.join(map(json.dumps, summaries)))
+    monkeypatch.setattr(regressions, 'invoke', invoke)
+    regressions.docker_memory_check('docker-fixture', 'reference-image')
+    command = calls[1]
+    for option in ('--memory=2g', '--memory-swap=2g', '--read-only', '--shm-size=16m'):
+        assert option in command
+    assert '--tmpfs' not in command
+    assert command[command.index('--volume') + 1] == '/tmp'
+    assert command[-1] == '--memory-child'
+    assert calls[-1][:3] == ['docker-fixture', 'rm', '-f']
+    assert '-v' in calls[-1]
+    first, second = map(json.loads, capsys.readouterr().out.splitlines())
+    assert first['flags']['memory_exceeded'] and second['flags']['disk_exceeded']
+
+
+def test_linux_resource_child_runs_both_candidates(monkeypatch, regressions, capsys):
+    codes = []
+    def execute(request):
+        code = request['run_argv'][-1]
+        codes.append(code)
+        return dict(stage='run', returncode=-9,
+                    memory_exceeded=code == regressions.AGGREGATE_MEMORY,
+                    disk_exceeded=code == regressions.DISK_EXHAUSTION,
+                    timeout=False, overflow=False, output_not_decodable=False)
+    monkeypatch.setattr(regressions.sys, 'argv', ['linux_regressions.py', '--memory-child'])
+    monkeypatch.setattr(regressions.sys, 'platform', 'linux')
+    monkeypatch.setattr(regressions.os, 'geteuid', lambda: 0)
+    monkeypatch.setattr(regressions, 'execute', execute)
+    regressions.main()
+    assert codes == [regressions.AGGREGATE_MEMORY, regressions.DISK_EXHAUSTION]
+    assert len(capsys.readouterr().out.splitlines()) == 2
+
+
+@pytest.mark.parametrize('memory', [False, True])
+def test_fork_accepts_signed_memory_limit(monkeypatch, regressions, memory, capsys):
+    receipt = dict(stage='run', returncode=-9 if memory else 1,
+                   output='' if memory else '20\n', output_not_decodable=False,
+                   timeout=False, overflow=False, memory_exceeded=memory)
+    monkeypatch.setattr(regressions, 'execute', lambda *args, **kwargs: receipt)
+    regressions.check_failure(regressions.FORK_EXHAUSTION)
+    assert json.loads(capsys.readouterr().out)['flags']['incorrect']

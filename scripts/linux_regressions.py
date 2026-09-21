@@ -16,10 +16,10 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'cobol_javatrans'))
-from sandbox_runner import SETUP, RUNNER, CLEANUP_COMMAND, QUIESCENCE_COMMAND, QUIESCENCE_CHECK_COMMAND
+from sandbox_runner import SETUP, RUNNER, CLEANUP_COMMAND, QUIESCENCE_COMMAND, QUIESCENCE_CHECK_COMMAND, DIRECTORY_CLEANUP_COMMAND
 from receipt import verify_receipt, receipt_failure
 
-FLAGS = ('timeout', 'overflow', 'cleanup_failed', 'supervisor_error', 'output_not_decodable')
+FLAGS = ('disk_exceeded', 'memory_exceeded', 'timeout', 'overflow', 'cleanup_failed', 'supervisor_error', 'output_not_decodable')
 PYTHON = '/usr/local/bin/python3'
 # Only our authored assertion labels may be published, never arbitrary exc.args.
 ASSERTION_LABELS = frozenset({
@@ -29,7 +29,7 @@ ASSERTION_LABELS = frozenset({
     'memory-started', 'memory-returncode', 'compile-completed', 'compiler-success',
     'root-linux', 'docker-image-required', 'docker-info', 'docker-child-success',
     'docker-child-stage', 'docker-child-incorrect', 'docker-child-budget',
-    'docker-child-returncode',
+    'docker-child-returncode', 'cleanup-directory', 'aggregate-memory', 'disk-limit',
 })
 
 
@@ -65,14 +65,48 @@ print(count, flush=True)
 raise SystemExit(1)
 '''
 MEMORY_EXHAUSTION = '''import resource
-assert resource.getrlimit(resource.RLIMIT_AS)[0] <= 1536 * 1024**2
-assert resource.getrlimit(resource.RLIMIT_DATA)[0] <= 1536 * 1024**2
+assert resource.getrlimit(resource.RLIMIT_AS)[0] <= 1024**3
+assert resource.getrlimit(resource.RLIMIT_DATA)[0] <= 1024**3
 assert open('/proc/self/oom_score_adj').read().strip() == '1000'
 print('allocating', flush=True)
 blocks = []
 while True:
     blocks.append(bytearray(8 * 1024**2))
 '''
+
+
+AGGREGATE_MEMORY = """import os, time
+for _ in range(3):
+    if os.fork() == 0:
+        os.setsid()
+        blocks = []
+        for _ in range(600):
+            blocks.append(bytearray(1024**2))
+            time.sleep(0.001)
+        time.sleep(60)
+time.sleep(60)
+"""
+DISK_EXHAUSTION = """import itertools, os, tempfile
+# Keep work below the budget: only a scan of ALL /tmp can catch the sibling.
+# The cleanup exec owns deletion of both cjt-* trees after the signed verdict.
+other = tempfile.mkdtemp(prefix='cjt-disk-', dir='/tmp')
+block = b'x' * 1024**2
+for i in itertools.count():
+    if i < 64:
+        with open(str(i), 'wb') as f:
+            f.write(block)
+    with open(os.path.join(other, str(i)), 'wb') as f:
+        f.write(block)
+"""
+DETACHED_CHILD = """import os, time
+if os.fork() == 0:
+    os.setsid()
+    open('ready', 'w').close()
+    time.sleep(60)
+    os._exit(0)
+while not os.path.exists('ready'):
+    time.sleep(0.01)
+"""
 
 
 def invoke(command, **kwargs):
@@ -84,6 +118,7 @@ def independent_cleanup():
     assert result.returncode in (0, 1), 'cleanup-kill'
     result = invoke(QUIESCENCE_COMMAND)
     assert result.returncode == 0, 'cleanup-quiescent'
+    assert invoke(DIRECTORY_CLEANUP_COMMAND).returncode == 0, 'cleanup-directory'
 
 
 def execute(request, *, budget=False):
@@ -107,10 +142,7 @@ def execute(request, *, budget=False):
         assert receipt['cwd'] == setup['cwd'], 'receipt-cwd'
         return receipt
     finally:
-        try:
-            independent_cleanup()
-        finally:
-            shutil.rmtree(setup['cwd'], ignore_errors=True)
+        independent_cleanup()
 
 
 def request_for(code):
@@ -135,7 +167,8 @@ def check_failure(code, *, budget=False, **flags):
     if code == INVALID_BYTES:
         assert receipt['output_not_decodable'], 'invalid-bytes-detected'
     elif code == FORK_EXHAUSTION:
-        assert 0 < int(receipt['output'].strip()) < 64, 'fork-count'
+        assert receipt.get('memory_exceeded') or (receipt['returncode'] == 1 and
+            0 < int(receipt['output'].strip()) < 64), 'fork-count'
     elif code == MEMORY_EXHAUSTION:
         assert receipt['output'] == 'allocating\n', 'memory-started'
         assert receipt['returncode'] == (1 if budget else -9), 'memory-returncode'
@@ -172,7 +205,15 @@ def main():
     assert sys.platform == 'linux' and os.geteuid() == 0, 'root-linux'
     if args.memory_child:
         with check('memory:docker-child'):
-            check_failure(MEMORY_EXHAUSTION, docker_memory_budget=True)
+            receipt = execute(request_for(AGGREGATE_MEMORY))
+            assert receipt.get('memory_exceeded') and receipt_failure(receipt), 'aggregate-memory'
+            report(receipt, incorrect=True, docker_memory_budget=True)
+        with check('disk:docker-child'):
+            receipt = execute(request_for(DISK_EXHAUSTION))
+            assert receipt.get('disk_exceeded') and receipt['returncode'] != 0, 'disk-limit'
+            assert receipt_failure(receipt) == 'disk limit exceeded', 'failure-classified'
+            assert not any(receipt.get(k) for k in FLAGS if k != 'disk_exceeded'), 'failure-flags'
+            report(receipt, incorrect=True)
         return
     compiler_smokes()
     with check('invalid_bytes'):
@@ -194,11 +235,14 @@ def docker_memory_check(docker, image):
     assert invoke([docker, 'info']).returncode == 0, 'docker-info'
     # The checkout must exist at this same path on the Docker daemon host.
     # Cloud Build provides /workspace to both the outer and nested containers.
+    # Anonymous disk volume permits compiler execution; --rm (or rm -v on
+    # failure) removes it. The supervisor's disk watchdog bounds writes.
     name = f'cjt-memory-regression-{os.getpid()}'
     try:
         result = invoke([
             docker, 'run', '--rm', '--init', '--name', name, '--network=none',
-            '--memory=512m', '--memory-swap=512m', '--pids-limit=128', '--cpus=1',
+            '--memory=2g', '--memory-swap=2g', '--pids-limit=128', '--cpus=1',
+            '--read-only', '--volume', '/tmp', '--shm-size=16m',
             '--cap-drop=ALL', '--cap-add=SETUID', '--cap-add=SETGID', '--cap-add=KILL',
             '--cap-add=CHOWN', '--cap-add=DAC_OVERRIDE', '--security-opt=no-new-privileges',
             '--user=0:0', '-v', f'{ROOT}:{ROOT}:ro', '--entrypoint', PYTHON,
@@ -206,14 +250,17 @@ def docker_memory_check(docker, image):
         ])
         assert result.returncode == 0, 'docker-child-success'
         # Parse and whitelist the child's summary; never forward raw stdout.
-        summary = json.loads(result.stdout)
-        assert summary['stage'] == 'run', 'docker-child-stage'
-        assert summary['flags']['incorrect'] is True, 'docker-child-incorrect'
-        assert summary['flags']['docker_memory_budget'] is True, 'docker-child-budget'
-        assert summary['returncode'] in (1, -9), 'docker-child-returncode'
-        report({**summary, **summary['flags']}, incorrect=True, docker_memory_budget=True)
+        summaries = [json.loads(line) for line in result.stdout.splitlines()]
+        assert len(summaries) == 2, 'docker-child-success'
+        for summary, expected in zip(summaries, ('memory_exceeded', 'disk_exceeded')):
+            assert summary['stage'] == 'run', 'docker-child-stage'
+            assert summary['flags']['incorrect'] is True, 'docker-child-incorrect'
+            assert summary['flags'][expected] is True, 'docker-child-budget'
+            assert summary['returncode'] != 0, 'docker-child-returncode'
+            report({**summary, **summary['flags']}, incorrect=True, **{expected: True})
+
     finally:
-        invoke([docker, 'rm', '-f', name])
+        invoke([docker, 'rm', '-f', '-v', name])
 
 
 if __name__ == '__main__':

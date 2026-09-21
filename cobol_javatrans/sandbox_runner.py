@@ -50,6 +50,12 @@ while True:
 '''
 QUIESCENCE_COMMAND = ["timeout", "-s", "KILL", "5s",
                       "/usr/local/bin/python3", "-I", "-c", UID_QUIESCENCE]
+# Only the independent exec deletes candidate directories. timeout bounds even
+# uninterruptible filesystem work; the receipt-producing process never deletes.
+DIRECTORY_CLEANUP_COMMAND = [
+    "timeout", "-s", "KILL", "5s", "find", "/tmp", "-maxdepth", "1",
+    "-name", "cjt-*", "-exec", "rm", "-rf", "--", "{}", "+",
+]
 # Same definition of live processes, without killing an unexpectedly occupied UID.
 QUIESCENCE_CHECK_COMMAND = QUIESCENCE_COMMAND + ["--check-only"]
 
@@ -69,17 +75,18 @@ sys.stdout.write(json.dumps({"cwd": work, "key": key}))
 RUNNER = r'''
 import base64
 import ctypes
+import errno
 import hashlib
 import hmac
 import json
 import os
 import resource
-import shutil
 import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 CANDIDATE_UID = 65532
@@ -105,9 +112,9 @@ JAVA_TOOL_OPTIONS = "-Xmx512m -XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSiz
 def candidate_limits(java=False):
     # Leave process slots for the root supervisor and independent cleanup execs.
     # Clamp to inherited budgets as well (the Linux regression uses prlimit).
-    # Native toolchains get 1.5 GiB per process; the 2 GiB pod still bounds the
-    # aggregate. Java needs additional virtual reservations, not resident RAM.
-    memory = 8 * 1024**3 if java else 1536 * 1024**2
+    # The RSS watchdog bounds aggregate memory, including Java reservations
+    # that become resident. Keep independent per-process native limits too.
+    memory = 8 * 1024**3 if java else 1024**3
     for kind, value in ((resource.RLIMIT_NPROC, 64),
                         (resource.RLIMIT_AS, memory),
                         (resource.RLIMIT_DATA, memory),
@@ -150,6 +157,105 @@ def kill_group(pgid):
 
 
 
+AGGREGATE_MEMORY = 768 * 1024**2
+WATCHDOG_INTERVAL = 0.05
+AGGREGATE_DISK = 256 * 1024**2
+DISK_WATCHDOG_INTERVAL = 0.1
+
+
+def candidate_processes():
+    # gVisor reports full per-process VmRSS even for forked copy-on-write pages:
+    # 64 Python forks can hit this conservative aggregate budget. Legitimate
+    # compiler/JVM chains use a handful of processes and stay far below 768 MiB.
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/" + name + "/status") as f:
+                status = dict(line.split(":", 1) for line in f if ":" in line)
+            if status["Uid"].split()[0] == str(CANDIDATE_UID):
+                yield int(name), int(status.get("VmRSS", "0 kB").split()[0]) * 1024
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+
+
+def kill_candidate(pgid, processes=None):
+    # Shared watchdog path: immediate KILL without a TERM grace-period burst.
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    if processes is None:
+        processes = candidate_processes()
+    for pid, _ in processes:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def memory_watchdog(pgid, stopped, status):
+    try:
+        while not stopped.is_set():
+            processes = list(candidate_processes())
+            if sum(rss for _, rss in processes) > AGGREGATE_MEMORY:
+                status["memory_exceeded"] = True
+                kill_candidate(pgid, processes)
+                return
+            stopped.wait(WATCHDOG_INTERVAL)
+    except Exception:
+        status["supervisor_error"] = True
+        # Fail closed if monitoring itself fails; don't run unmonitored.
+        kill_candidate(pgid)
+
+
+def disk_usage(roots=("/tmp", "/dev/shm")):
+    # Use directory descriptors so a concurrent rename/symlink replacement
+    # cannot redirect traversal outside the mounts. Never open candidate file
+    # contents or FIFOs/devices; count allocated blocks, not apparent size.
+    races = (errno.ENOENT, errno.ENOTDIR, errno.ELOOP)
+
+    def walk(path, parent=None):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                         dir_fd=parent)
+        except OSError as exc:
+            if exc.errno in races:
+                return 0
+            raise
+        try:
+            total = 0
+            with os.scandir(fd) as entries:
+                for entry in entries:
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                        if stat.S_ISREG(info.st_mode):
+                            total += info.st_blocks * 512
+                        elif stat.S_ISDIR(info.st_mode):
+                            total += walk(entry.name, fd)
+                    except OSError as exc:
+                        if exc.errno not in races:
+                            raise
+            return total
+        finally:
+            os.close(fd)
+
+    return sum(walk(root) for root in roots)
+
+
+def disk_watchdog(pgid, stopped, status):
+    try:
+        while not stopped.is_set():
+            if disk_usage() > AGGREGATE_DISK:
+                status["disk_exceeded"] = True
+                kill_candidate(pgid)
+                return
+            stopped.wait(DISK_WATCHDOG_INTERVAL)
+    except Exception:
+        status["supervisor_error"] = True
+        kill_candidate(pgid)
+
+
 def sweep_uid():
     # NPROC must permit compiler subprocesses/JVM threads. Repeatedly sweep the
     # reserved UID and reap adopted descendants, including setsid escapees.
@@ -188,9 +294,11 @@ def run_step(argv, timeout, candidate_work):
     if not isinstance(argv, list) or not argv or any(not isinstance(x, str) for x in argv):
         raise ValueError("argv must be a nonempty string list")
     status = dict(returncode=125, timeout=False, overflow=False,
-                  cleanup_failed=False, supervisor_error=False)
+                  cleanup_failed=False, supervisor_error=False, memory_exceeded=False, disk_exceeded=False)
     output = b""
     child = None
+    watchers = []
+    stopped = threading.Event()
     java = os.path.basename(argv[0]) in {"javac", "java"}
     env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": candidate_work, "TMPDIR": candidate_work}
     if java:
@@ -203,6 +311,13 @@ def run_step(argv, timeout, candidate_work):
                     stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, close_fds=True,
                     start_new_session=True, preexec_fn=lambda: restrict_child(java),
                 )
+                # Start only after Popen's preexec has completed (no fork with
+                # this watchdog thread active). Keep monitoring through cleanup.
+                for monitor in (memory_watchdog, disk_watchdog):
+                    watcher = threading.Thread(target=monitor,
+                        args=(child.pid, stopped, status), daemon=True)
+                    watcher.start()
+                    watchers.append(watcher)
                 try:
                     status["returncode"] = child.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
@@ -224,6 +339,9 @@ def run_step(argv, timeout, candidate_work):
                         sweep_uid()
                     except Exception:
                         status["cleanup_failed"] = True
+                stopped.set()
+                for watcher in watchers:
+                    watcher.join()
             stdout.seek(0)
             output = stdout.read(limit + 1)
             status["overflow"] = len(output) >= limit or os.fstat(stderr.fileno()).st_size >= limit
@@ -233,7 +351,7 @@ def run_step(argv, timeout, candidate_work):
 
 
 status = dict(returncode=125, timeout=False, overflow=False,
-              cleanup_failed=False, supervisor_error=False)
+              cleanup_failed=False, supervisor_error=False, memory_exceeded=False, disk_exceeded=False)
 stage = "compile"
 output = b""
 
@@ -252,7 +370,7 @@ try:
         os.chmod(path, 0o644)
     status, output = run_step(request["argv"], request["timeout"], candidate_work)
     if (status["returncode"] == 0 and not any(status[flag] for flag in
-            ("timeout", "overflow", "cleanup_failed", "supervisor_error")) and "run_argv" in request):
+            ("timeout", "overflow", "cleanup_failed", "supervisor_error", "memory_exceeded", "disk_exceeded")) and "run_argv" in request):
         stage = "run"
         status, output = run_step(request["run_argv"], request["run_timeout"], candidate_work)
         if "output_file" in request and status["returncode"] == 0 and not status["timeout"]:
@@ -279,9 +397,6 @@ finally:
                       "output": base64.b64encode(output).decode("ascii"), "cwd": work}, separators=(",", ":"))
     tag = hmac.new(key, body.encode(), hashlib.sha256).hexdigest()
     sys.stdout.write(json.dumps({"body": body, "tag": tag}))
-    sys.stdout.flush()  # Publish BEFORE any optional directory cleanup.
-    try:
-        shutil.rmtree(work, ignore_errors=True)
-    except Exception:
-        pass  # Receipt is already committed; sandbox teardown removes leftovers.
+    sys.stdout.flush()
+    os._exit(0)  # No deletion, finalizers, or interpreter shutdown after signing.
 '''

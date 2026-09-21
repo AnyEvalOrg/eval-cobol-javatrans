@@ -26,3 +26,16 @@ spec:
         {{- toYaml $service.securityContext | nindent 8 }}
       resources:
         {{- toYaml $service.resources | nindent 8 }}
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: tmp
+      emptyDir:
+        sizeLimit: 512Mi
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 16Mi

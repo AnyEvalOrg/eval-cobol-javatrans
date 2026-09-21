@@ -23,7 +23,7 @@ def verify_receipt(stdout: str, key: bytes) -> dict | None:
                 or receipt.get("stage") not in ("compile", "run")
                 or not re.fullmatch(r"/tmp/cjt-[a-zA-Z0-9_-]+", receipt["cwd"])
                 or any(type(receipt.get(flag, False)) is not bool
-                       for flag in ("cleanup_failed", "supervisor_error"))):
+                       for flag in ("cleanup_failed", "supervisor_error", "memory_exceeded", "disk_exceeded"))):
             return None
     except (ValueError, TypeError, KeyError, AttributeError, UnicodeError):
         return None
@@ -43,6 +43,10 @@ def verify_receipt(stdout: str, key: bytes) -> dict | None:
 
 def receipt_failure(receipt: dict) -> str | None:
     """Authenticated execution failures are INCORRECT in both task directions."""
+    if receipt.get("disk_exceeded"):
+        return "disk limit exceeded"
+    if receipt.get("memory_exceeded"):
+        return "memory limit exceeded"
     if receipt["output_not_decodable"]:
         return "output not decodable."
     if receipt.get("cleanup_failed"):

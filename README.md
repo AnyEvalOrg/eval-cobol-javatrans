@@ -103,26 +103,47 @@ its process group and repeated reserved-UID sweeps using `/proc` and `os.kill`,
 without spawning cleanup processes. The supervisor acts as a Linux subreaper and
 reaps adopted descendants, including those that changed sessions. Post-run errors
 produce signed failure flags, and failed cleanup blocks the next stage. The receipt
-is flushed before optional directory removal, whose exceptions cannot erase it.
+is written and flushed, then the supervisor immediately calls `os._exit(0)`.
+No directory deletion or interpreter finalizers run in that exec.
 
-Native compiler/runtime children have hard **1.5 GiB RLIMIT_AS and RLIMIT_DATA**
+Native compiler/runtime children have hard **1 GiB RLIMIT_AS and RLIMIT_DATA**
 limits. Java steps use **8 GiB** virtual address/data limits to accommodate JVM
 reservations and `JAVA_TOOL_OPTIONS="-Xmx512m -XX:MaxMetaspaceSize=256m
 -XX:ReservedCodeCacheSize=64m -Xss1m"`. These limits are clamped to any tighter
 inherited hard limits. The root preexec child writes `1000` to its
 `/proc/self/oom_score_adj` before dropping credentials; descendants inherit the
-OOM preference. Core dumps remain disabled and RLIMIT_FSIZE remains 1 MiB.
-The 2 GiB pod budget leaves 512 MiB beyond a single native process's allocation
-limit and also caps aggregate usage across compiler subprocesses. JVM steps have
-bounded heap/metaspace/code cache within the same pod budget.
+OOM preference on native Linux; gVisor records this setting but does not use it.
+It is not the aggregate memory boundary. A supervisor watchdog runs throughout
+each candidate step, sampling `/proc/<pid>/status` every **50 ms** and summing
+`VmRSS` for every process with UID 65532, including detached sessions and JVMs.
+Above **768 MiB**, it immediately kills the candidate group and UID processes and
+signs `memory_exceeded=True`, which scores INCORRECT (`memory limit exceeded`).
+gVisor counts copy-on-write pages in each fork's VmRSS, so fork exhaustion may
+legitimately trip this conservative budget. Compiler/JVM chains use a handful of
+processes and stay far below 768 MiB. Core dumps remain disabled and RLIMIT_FSIZE
+remains 1 MiB per file.
+
+A second supervisor watchdog scans **all of `/tmp` and `/dev/shm` every 100 ms**,
+summing `st_blocks * 512` for regular files with a race-tolerant `os.scandir` walk
+that does not follow symlinks. Above **256 MiB**, it uses the same immediate kill
+path and signs `disk_exceeded=True`, scoring INCORRECT (`disk limit exceeded`).
+Both watchdogs remain active through process cleanup; either flag blocks the next
+stage. Directory deletion still belongs to the independent cleanup exec.
 
 The host always performs the template's separate bounded
 `/usr/bin/pkill -KILL -u 65532` cleanup exec, even after setup failures, lost or
 invalid receipts, and cancellation. Because forks are permitted, another bounded
 exec repeats sweeps and verifies that no live process with that UID remains before
 reusing the sandbox. Zombies cannot execute and are ignored by this independent
-verification. Cleanup failure aborts scoring with `details withheld`. UID 65532
-must be reserved solely for candidates; tests within a per-sample sandbox execute
+verification. A third independent exec deletes `/tmp/cjt-*` using
+`timeout -s KILL 5s find ... -exec rm -rf ...`; deletion never delays the receipt.
+The scorer decides the signed verdict first. If independent cleanup or deletion
+fails, a signed failure retains its INCORRECT explanation; a signed success
+becomes INCORRECT with `candidate left processes that could not be cleaned up`.
+No further test runs after failed cleanup. Only an absent valid signed receipt
+causes the withheld-details harness error, including when cleanup also fails.
+Each pod belongs to one sample and is discarded afterwards, with no reuse across
+samples. UID 65532 must be reserved solely for candidates; tests execute
 sequentially. An unauthenticated run waits through its host deadline before cleanup
 to avoid racing a delayed supervisor start.
 
@@ -130,23 +151,23 @@ Setup has a 5-second container/provider limit and 10-second host limit. The comb
 supervisor has a 100-second container/provider limit and 105-second host limit,
 covering the two step deadlines and cleanup overhead. Each independent cleanup
 exec has a 5-second container/provider limit and 10-second host limit. Normal
-completion removes the directory; sandbox teardown discards leftovers after an
-abnormally terminated supervisor.
+independent cleanup removes the directory; sandbox teardown discards leftovers
+after failed cleanup or an abnormally terminated supervisor.
 
 Stdout/stderr use anonymous bounded files. File size and output limits are 1 MiB.
 COBOL output is read only after child cleanup, using O_NOFOLLOW/O_NONBLOCK and
 checks for a regular file, reserved UID ownership, and one hard link. Missing
 files, symlinks, FIFOs, and unsafe files fail. The receipt authenticates directory,
-stage, exit status from wait(), timeout, overflow, and captured bytes with
-HMAC-SHA256. Candidate/provider completion markers cannot forge a successful
+stage, exit status from wait(), timeout, overflow, aggregate memory exhaustion,
+cleanup/supervisor failures, and captured bytes with HMAC-SHA256. Candidate/provider completion markers cannot forge a successful
 receipt; provider success/returncode never decide the compile/run verdict.
 An absent or unverifiable receipt (including a wrong directory, lost exec response,
 or setup/supervisor exec timeout or output limit) is a harness failure: the scorer
 raises `RuntimeError("Private sandbox operation failed; details withheld.")`.
 Inspect records a sample error and AnyEval refuses to publish the run, so it does
 not enter the published pass rate. Candidate failures reported in authenticated
-receipts, including timeouts, output overflow, post-run/cleanup failures, and
-undecodable output, remain incorrect verdicts. Raw candidate bytes are base64
+receipts, including timeouts, memory exhaustion, output overflow, post-run/cleanup
+failures, and undecodable output, remain incorrect verdicts. Raw candidate bytes are base64
 encoded before signing. The verifier authenticates the envelope and strictly
 validates supervisor-owned fields first; malformed base64, output shape, or UTF-8
 then becomes authenticated `output not decodable`, never a missing receipt.
@@ -191,7 +212,14 @@ ingress and egress, including DNS, are denied. The Pod uses gVisor, GKE Spot, no
 service-account token, no host networking/mounts, no sidecars, and restartPolicy
 Never. Requests equal limits: **1 CPU, 2 GiB memory, 1 GiB ephemeral storage**.
 Equal CPU/memory reservations provide Guaranteed QoS and reserve the supervisor's
-memory headroom; `values.yaml` documents the candidate memory budgets.
+memory headroom; `values.yaml` documents the candidate memory budgets. The sandbox
+root filesystem is read-only. `/tmp` is a **disk-backed `emptyDir`** with
+**512Mi sizeLimit** as an eviction backstop. `/dev/shm` remains a Memory `emptyDir`
+with **16Mi sizeLimit**. Production gVisor does not enforce Memory `emptyDir`
+sizeLimit as a tmpfs mount size, so containment uses the supervisor's disk
+watchdog: **256 MiB + one 100 ms write burst** across both mounts. gVisor gofer
+write throughput makes this burst small relative to the 512 MiB backstop and
+1 GiB pod ephemeral-storage budget.
 Autopilot supplies the Spot toleration; the chart adds none. The task defaults
 `INSPECT_K8S_DEFAULT_NAMESPACE` to `anyeval-sandbox` without overriding an existing
 setting. Trusted execs run as root with only SETUID, SETGID, KILL, CHOWN, and
@@ -239,7 +267,8 @@ The standalone `scripts/linux_regressions.py` runs the actual SETUP + RUNNER and
 shared receipt verifier as root inside the reference image, with no Inspect
 installation. It first checks real `javac`/`java` and `cobc`/COBOL startup under the
 limits, then checks invalid UTF-8, detached children exhausting their fork budget,
-and unbounded memory allocation. Each attack must produce an authenticated
+aggregate memory allocation (three children allocating 600 MiB each), and
+unbounded 1 MiB file writes until the disk watchdog kills the candidate. Each attack must produce an authenticated
 INCORRECT outcome; success logs contain only stage, returncode, and boolean flags.
 Regression failures additionally name the check (`step`, such as
 `compiler_smoke:cobc`), exception class (`error`), and an allowlisted assertion
@@ -247,17 +276,42 @@ Regression failures additionally name the check (`step`, such as
 printed. The pre-setup UID check uses the cleanup sweep's live-process definition
 (ignoring zombies) without killing processes. Both compiler smokes require a
 `run` receipt; a successful compile-only receipt does not pass them.
-When Docker is available, the memory case runs in a fresh `docker run
---memory=512m --memory-swap=512m --pids-limit=128` and must survive a candidate OOM
-kill with an authenticated receipt. Without Docker, a real `prlimit` AS/DATA
+When Docker is available, aggregate memory and disk exhaustion run in a fresh
+`docker run --memory=2g --memory-swap=2g --pids-limit=128 --read-only
+--volume /tmp --shm-size=16m`. The anonymous writable disk volume allows compiler
+execution and is removed with the container. The memory case must sign
+`memory_exceeded`; the disk case must sign `disk_exceeded=True` with a nonzero
+returncode. The disk writer creates 64 MiB in its work directory and writes
+without bound in a second `cjt-*` directory directly under `/tmp`, proving coverage
+outside the work directory. Both directories use the independent cleanup path. Without
+Docker, a real `prlimit` AS/DATA
 budget of 512 MiB checks allocation failure and receipt survival; this fallback
 does **not** attest cgroup OOM behavior. Docker availability with a broken daemon
 is a failure, not a fallback. The checkout must be mounted at the same absolute
 path on the Docker daemon host and in the script's container.
 
+The operator-only Inspect task `scripts/k8s_regressions.py` uses the exact package
+Kubernetes chart and values (gVisor, deny-all egress, read-only root, disk-backed
+`/tmp` and Memory `/dev/shm`). It is not registered as a package task. With the operator's `KUBECONFIG`:
+
+```bash
+inspect eval scripts/k8s_regressions.py --model mockllm/model
+```
+
+It runs the real SETUP + RUNNER against invalid UTF-8, fork exhaustion, three
+600 MiB allocating children, files until `disk_exceeded=True`, and a zero-exit parent leaving a
+`setsid` child sleeping. CORRECT requires every signed receipt to match its
+expected flags, independent cleanup to succeed, and a fresh sandbox exec to
+confirm the pod remains usable after each case. Its JSON summary contains only
+boolean flags, never candidate output, receipts, or keys. This production-runtime
+check, including actual gVisor disk-watchdog containment, requires a live cluster;
+local protocol tests do not attest it.
+
 Operators can run the full Docker regression via Cloud Build (substitute the
 reference image digest). The supplied build uses the Docker builder's client and
-socket, a disposable 2 GiB/128 PID outer container, and the 512 MiB inner container:
+socket, a disposable 2 GiB/128 PID outer container, and a 2 GiB inner container
+with a writable disk volume and the supervisor disk watchdog. The Docker client
+is copied into `/workspace/.linux-regressions/docker` and passed with `--docker-cli`:
 
 ```bash
 gcloud builds submit . --config scripts/cloudbuild-linux-regressions.yaml \

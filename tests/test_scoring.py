@@ -25,7 +25,7 @@ class FakeSandbox:
             return result(json.dumps({"cwd": self.paths[-1], "key": self.key.hex()}))
         if cmd == scoring.CLEANUP_COMMAND:
             return result("", returncode=1)
-        if cmd == scoring.QUIESCENCE_COMMAND:
+        if cmd in (scoring.QUIESCENCE_COMMAND, scoring.DIRECTORY_CLEANUP_COMMAND):
             return result("", returncode=0)
         response = next(self.results)
         if isinstance(response, Exception):
@@ -45,6 +45,8 @@ def signed_receipt(key, cwd, output="2", **kwargs):
                            timeout=kwargs.get("timeout", False),
                            overflow=kwargs.get("overflow", False), stage=kwargs.get("stage", "run"), cwd=cwd,
                            cleanup_failed=kwargs.get("cleanup_failed", False),
+                           memory_exceeded=kwargs.get("memory_exceeded", False),
+                           disk_exceeded=kwargs.get("disk_exceeded", False),
                            supervisor_error=kwargs.get("supervisor_error", False),
                            output=base64.b64encode(output if isinstance(output, bytes) else output.encode()).decode()))
     return json.dumps({"body": body, "tag": hmac.new(key, body.encode(), hashlib.sha256).hexdigest()})
@@ -116,9 +118,9 @@ def test_scorer_results_with_fake_sandbox(monkeypatch, kind, outcome):
         if outcome == 'incomplete':
             assert score.explanation == 'Test 1: run did not complete.'
     count = 2 if outcome == 'correct' and kind == 'java_to_cobol' else 1
-    assert len(fake.calls) == count * 4
+    assert len(fake.calls) == count * 5
     assert len(set(fake.paths)) == count
-    for setup, run, cleanup in zip(fake.calls[::4], fake.calls[1::4], fake.calls[2::4]):
+    for setup, run, cleanup in zip(fake.calls[::5], fake.calls[1::5], fake.calls[2::5]):
         assert cleanup[0] == scoring.CLEANUP_COMMAND
         assert setup[0][:4] == ['timeout', '-s', 'KILL', '5s']
         assert run[0][:4] == ['timeout', '-s', 'KILL', '100s']
@@ -175,7 +177,7 @@ def test_lost_supervisor_response_is_a_harness_error(monkeypatch):
     fake = FakeSandbox([ConnectionError("cluster unavailable")])
     install_sandbox(monkeypatch, fake)
     assert_harness_failure()
-    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+    assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND
 
 
 @pytest.mark.parametrize("kind", ["java_to_cobol", "cobol_to_java"])
@@ -224,7 +226,7 @@ def test_authenticated_failure_channels(monkeypatch, field, value):
 def test_setup_timeout_is_bounded_and_a_harness_error(monkeypatch):
     class HungSetup(FakeSandbox):
         async def exec(self, cmd, **kwargs):
-            if cmd in (scoring.CLEANUP_COMMAND, scoring.QUIESCENCE_COMMAND):
+            if cmd in (scoring.CLEANUP_COMMAND, scoring.QUIESCENCE_COMMAND, scoring.DIRECTORY_CLEANUP_COMMAND):
                 return await super().exec(cmd, **kwargs)
             assert cmd[:4] == ["timeout", "-s", "KILL", "5s"]
             assert kwargs["timeout"] == 5
@@ -287,8 +289,9 @@ def test_cleanup_failure_aborts_before_next_test(monkeypatch, failure):
 
     fake = FailedCleanup([result()])
     install_sandbox(monkeypatch, fake)
-    with pytest.raises(RuntimeError, match='details withheld'):
-        asyncio.run(scoring.translation_scorer("java_to_cobol")(state(), Target('')))
+    score = asyncio.run(scoring.translation_scorer("java_to_cobol")(state(), Target('')))
+    assert score.value == INCORRECT
+    assert score.explanation == 'candidate left processes that could not be cleaned up'
     assert len(fake.paths) == 1
     assert fake.calls[-1][0] == scoring.CLEANUP_COMMAND
 
@@ -304,7 +307,7 @@ def test_scorer_cancellation_still_awaits_independent_uid_sweep(monkeypatch):
     install_sandbox(monkeypatch, fake)
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(scoring.translation_scorer("java_to_cobol")(state(), Target('')))
-    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+    assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND
 
 
 @pytest.mark.parametrize('failure', [TimeoutError(), ConnectionError(),
@@ -319,7 +322,7 @@ def test_setup_failure_also_issues_uid_cleanup(monkeypatch, failure):
     fake = FailedSetup([])
     install_sandbox(monkeypatch, fake)
     assert_harness_failure()
-    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+    assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND
 
 
 def test_cleanup_requires_quiescence_before_reusing_sandbox(monkeypatch):
@@ -331,8 +334,9 @@ def test_cleanup_requires_quiescence_before_reusing_sandbox(monkeypatch):
             return await super().exec(cmd, **kwargs)
     fake = StillRunning([result()])
     install_sandbox(monkeypatch, fake)
-    with pytest.raises(RuntimeError, match='details withheld'):
-        asyncio.run(scoring.translation_scorer('java_to_cobol')(state(), Target('')))
+    score = asyncio.run(scoring.translation_scorer('java_to_cobol')(state(), Target('')))
+    assert score.value == INCORRECT
+    assert score.explanation == 'candidate left processes that could not be cleaned up'
     assert len(fake.paths) == 1
     assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
 
@@ -362,8 +366,8 @@ def test_exec_that_never_returns_is_a_harness_error_and_still_cleans_up(monkeypa
     install_sandbox(monkeypatch, fake)
     monkeypatch.setattr(scoring.asyncio, 'timeout', short_timeout)
     assert_harness_failure()
-    assert deadlines == ([10, 10, 10] if stage == 'setup' else [10, 105, 10, 10])
-    assert [cmd for cmd, _ in fake.calls[-2:]] == [scoring.CLEANUP_COMMAND, scoring.QUIESCENCE_COMMAND]
+    assert deadlines == ([10, 10, 10, 10] if stage == 'setup' else [10, 105, 10, 10, 10])
+    assert [cmd for cmd, _ in fake.calls[-3:]] == [scoring.CLEANUP_COMMAND, scoring.QUIESCENCE_COMMAND, scoring.DIRECTORY_CLEANUP_COMMAND]
 
 
 @pytest.mark.parametrize('response', [
@@ -407,7 +411,7 @@ def test_receipt_rejection_is_an_inspect_sample_error_without_a_score(monkeypatc
     assert not sample.scores
     assert not any(event.event == 'score' for event in sample.events)
     assert 'PRIVATE_' not in sample.error.model_dump_json()
-    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+    assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND
 
 
 @pytest.mark.parametrize('kind', ['cobol_to_java', 'java_to_cobol'])
@@ -430,7 +434,7 @@ def test_authenticated_invalid_output_is_incorrect(monkeypatch, kind, output):
     score = asyncio.run(scoring.translation_scorer(kind)(state(kind), Target('')))
     assert score.value == INCORRECT
     assert score.explanation == 'Test 1: output not decodable.'
-    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+    assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND
 
 
 @pytest.mark.parametrize('flag', ['cleanup_failed', 'supervisor_error'])
@@ -439,12 +443,13 @@ def test_authenticated_post_run_failure_is_incorrect_with_independent_cleanup(mo
     install_sandbox(monkeypatch, fake)
     score = asyncio.run(scoring.translation_scorer('cobol_to_java')(state('cobol_to_java'), Target('')))
     assert score.value == INCORRECT
-    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+    assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND
 
 
 @pytest.mark.parametrize('field,value', [('stage', []), ('stage', 'unknown'), ('returncode', True),
     ('timeout', 1), ('overflow', 'false'), ('cwd', None), ('cwd', '/tmp/other'),
-    ('cleanup_failed', 1), ('supervisor_error', [])])
+    ('cleanup_failed', 1), ('supervisor_error', []), ('disk_exceeded', 1),
+    ('disk_exceeded', 'false'), ('disk_exceeded', None), ('memory_exceeded', 1)])
 def test_authenticated_control_fields_stay_strict(field, value):
     import hashlib
     import hmac
@@ -455,3 +460,49 @@ def test_authenticated_control_fields_stay_strict(field, value):
     envelope['body'] = json.dumps(body)
     envelope['tag'] = hmac.new(key, envelope['body'].encode(), hashlib.sha256).hexdigest()
     assert scoring.verify_receipt(json.dumps(envelope), key) is None
+
+
+@pytest.mark.parametrize('kind', ['java_to_cobol', 'cobol_to_java'])
+@pytest.mark.parametrize('cleanup_step', [scoring.CLEANUP_COMMAND, scoring.QUIESCENCE_COMMAND,
+                                         scoring.DIRECTORY_CLEANUP_COMMAND])
+@pytest.mark.parametrize('outcome', ['failure', 'success', 'missing'])
+def test_signed_verdict_precedes_cleanup(monkeypatch, kind, cleanup_step, outcome):
+    events = []
+    classify = scoring.receipt_failure
+
+    def observed_classify(receipt):
+        events.append('verdict')
+        return classify(receipt)
+
+    class FailedCleanup(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if cmd == cleanup_step:
+                events.append('cleanup')
+                raise TimeoutError('private deletion/quiescence details')
+            return await super().exec(cmd, **kwargs)
+
+    monkeypatch.setattr(scoring, 'receipt_failure', observed_classify)
+    response = '' if outcome == 'missing' else signed_receipt(
+        bytes(range(32)), '/tmp/cjt-fresh_1', timeout=outcome == 'failure')
+    fake = FailedCleanup([response])
+    install_sandbox(monkeypatch, fake)
+    if outcome == 'missing':
+        assert_harness_failure(kind)
+        assert events == ['cleanup']
+    else:
+        score = asyncio.run(scoring.translation_scorer(kind)(state(kind), Target('')))
+        assert score.value == INCORRECT
+        assert score.explanation == ('Test 1: run timeout.' if outcome == 'failure' else
+                                     'candidate left processes that could not be cleaned up')
+        assert events == ['verdict', 'cleanup']
+    assert len(fake.paths) == 1
+
+
+@pytest.mark.parametrize('kind', ['java_to_cobol', 'cobol_to_java'])
+@pytest.mark.parametrize('flag,reason', [('memory_exceeded', 'memory limit exceeded'),
+                                       ('disk_exceeded', 'disk limit exceeded')])
+def test_signed_resource_failure(monkeypatch, kind, flag, reason):
+    fake = FakeSandbox([signed_receipt(bytes(range(32)), '/tmp/cjt-fresh_1', **{flag: True})])
+    install_sandbox(monkeypatch, fake)
+    score = asyncio.run(scoring.translation_scorer(kind)(state(kind), Target('')))
+    assert score.value == INCORRECT and score.explanation == f'Test 1: {reason}'
