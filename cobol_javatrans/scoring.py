@@ -12,7 +12,7 @@ import re
 
 from inspect_ai.scorer import CORRECT, INCORRECT, Score, Target, accuracy, scorer
 from inspect_ai.solver import TaskState
-from inspect_ai.util import OutputLimitExceededError, sandbox
+from inspect_ai.util import sandbox
 
 from .dataset import load_records
 from .publication import private_grading
@@ -103,7 +103,7 @@ def translation_scorer(direction: str):
                             else:
                                 receipt = None
                         except Exception:
-                            # No authenticated supervisor report is a failed test,
+                            # No authenticated supervisor report is a harness failure,
                             # including a killed supervisor or lost exec response.
                             receipt = None
                     finally:
@@ -115,17 +115,13 @@ def translation_scorer(direction: str):
                         except asyncio.CancelledError:
                             await cleanup
                             raise
-            except TimeoutError:
-                return Score(value=INCORRECT, explanation=f"Test {index}: supervisor did not complete")
-            except OutputLimitExceededError:
-                return Score(value=INCORRECT, explanation=f"Test {index}: supervisor did not complete")
             except Exception:
                 # Provider exceptions may embed stdin or captured output. Do not
                 # allow them (or their exception chain) into an Inspect error event.
                 raise RuntimeError("Private sandbox operation failed; details withheld.") from None
             # Neither success nor returncode from the run provider is a verdict channel.
             if receipt is None:
-                return Score(value=INCORRECT, explanation=f"Test {index}: supervisor did not complete")
+                raise RuntimeError("Private sandbox operation failed; details withheld.") from None
             if receipt["timeout"]:
                 return Score(value=INCORRECT, explanation=f"Test {index}: {receipt['stage']} timeout.")
             if receipt["overflow"]:
@@ -145,7 +141,7 @@ def translation_scorer(direction: str):
             return await private_score(state, target)
         except Exception:
             pass
-        raise RuntimeError("Private scoring failed; details withheld.") from None
+        raise RuntimeError("Private sandbox operation failed; details withheld.") from None
 
     return score
 

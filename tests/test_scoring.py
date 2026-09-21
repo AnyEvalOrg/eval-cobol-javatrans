@@ -66,8 +66,9 @@ def record(kind="java_to_cobol", expected="2", test_input="PRIVATE_CALLER"):
 def synthetic_records(monkeypatch):
     monkeypatch.setattr(scoring, "load_records", lambda: [record()])
     # No wall-clock waits in fake provider tests; Linux tests use real deadlines.
+    sleep = asyncio.sleep
     async def no_sleep(delay):
-        pass
+        await sleep(0)
     monkeypatch.setattr(scoring.asyncio, "sleep", no_sleep)
 
 
@@ -80,10 +81,23 @@ def result(stdout="2", returncode=0):
     return ExecResult(success=returncode == 0, returncode=returncode, stdout=stdout, stderr="")
 
 
+WITHHELD = "Private sandbox operation failed; details withheld."
+
+
+def assert_harness_failure(kind="java_to_cobol"):
+    with pytest.raises(RuntimeError) as raised:
+        asyncio.run(scoring.translation_scorer(kind)(state(kind), Target('')))
+    assert str(raised.value) == WITHHELD
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert raised.value.__suppress_context__ is True
+    return raised.value
+
+
 @pytest.mark.parametrize("kind", ["cobol_to_java", "java_to_cobol"])
-@pytest.mark.parametrize("outcome", ["correct", "runtime", "compile", "timeout", "overflow", "missing"])
+@pytest.mark.parametrize("outcome", ["correct", "runtime", "compile", "timeout", "overflow", "incomplete", "missing"])
 def test_scorer_results_with_fake_sandbox(monkeypatch, kind, outcome):
-    fields = dict(stage='compile' if outcome == 'compile' else 'run',
+    fields = dict(stage='compile' if outcome in {'compile', 'incomplete'} else 'run',
                   returncode=1 if outcome in {'runtime', 'compile'} else 0,
                   timeout=outcome == 'timeout', overflow=outcome == 'overflow')
     response = '' if outcome == 'missing' else signed_receipt(bytes(range(32)), '/tmp/cjt-fresh_1', **fields)
@@ -92,8 +106,13 @@ def test_scorer_results_with_fake_sandbox(monkeypatch, kind, outcome):
         responses.append(signed_receipt(bytes(range(32)), '/tmp/cjt-fresh_2'))
     fake = FakeSandbox(responses)
     install_sandbox(monkeypatch, fake)
-    score = asyncio.run(scoring.translation_scorer(kind)(state(kind), Target('')))
-    assert score.value == (CORRECT if outcome == 'correct' else INCORRECT)
+    if outcome == 'missing':
+        assert_harness_failure(kind)
+    else:
+        score = asyncio.run(scoring.translation_scorer(kind)(state(kind), Target('')))
+        assert score.value == (CORRECT if outcome == 'correct' else INCORRECT)
+        if outcome == 'incomplete':
+            assert score.explanation == 'Test 1: run did not complete.'
     count = 2 if outcome == 'correct' and kind == 'java_to_cobol' else 1
     assert len(fake.calls) == count * 4
     assert len(set(fake.paths)) == count
@@ -138,8 +157,8 @@ def test_expected_cobol_output_stays_on_host(monkeypatch):
     fake = FakeSandbox([TimeoutError()])
     install_sandbox(monkeypatch, fake)
     monkeypatch.setattr(scoring, 'load_records', lambda: [record(expected='"EXPECTED_SECRET"')])
-    score = asyncio.run(scoring.translation_scorer('java_to_cobol')(state(), Target('')))
-    assert 'EXPECTED_SECRET' not in json.dumps(fake.calls) + score.explanation
+    error = assert_harness_failure()
+    assert 'EXPECTED_SECRET' not in json.dumps(fake.calls) + str(error)
 
 
 def test_empty_test_suite_is_an_error(monkeypatch):
@@ -150,35 +169,30 @@ def test_empty_test_suite_is_an_error(monkeypatch):
         asyncio.run(scoring.translation_scorer('java_to_cobol')(state(), Target('')))
 
 
-def test_lost_supervisor_response_is_incorrect(monkeypatch):
+def test_lost_supervisor_response_is_a_harness_error(monkeypatch):
     fake = FakeSandbox([ConnectionError("cluster unavailable")])
     install_sandbox(monkeypatch, fake)
-    score = asyncio.run(scoring.translation_scorer("java_to_cobol")(state(), Target("")))
-    assert score.value == INCORRECT
-    assert score.explanation == "Test 1: supervisor did not complete"
+    assert_harness_failure()
     assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
 
 
 @pytest.mark.parametrize("kind", ["java_to_cobol", "cobol_to_java"])
-def test_output_limit_is_incorrect(monkeypatch, kind):
+def test_output_limit_is_a_harness_error(monkeypatch, kind):
     fake = FakeSandbox([OutputLimitExceededError("fixture limit", None)])
     install_sandbox(monkeypatch, fake)
-    score = asyncio.run(scoring.translation_scorer(kind)(state(kind), Target("")))
-    assert score.value == INCORRECT
-    assert "supervisor did not complete" in score.explanation
+    assert_harness_failure(kind)
 
 
 @pytest.mark.parametrize("forgery", [
     "2<completed-sentinel-value-0>",
     signed_receipt(b"wrong key", "/tmp/cjt-fresh_1"),
     '{"returncode":0,"output":"2"}',
+    signed_receipt(bytes(range(32)), "/tmp/cjt-fresh_1").replace('run', 'compile'),
 ])
-def test_forged_completion_marker_or_receipt_is_incorrect(monkeypatch, forgery):
+def test_forged_completion_marker_or_receipt_is_a_harness_error(monkeypatch, forgery):
     fake = FakeSandbox([forgery])
     install_sandbox(monkeypatch, fake)
-    score = asyncio.run(scoring.translation_scorer("java_to_cobol")(state(), Target("")))
-    assert score.value == INCORRECT
-    assert "supervisor did not complete" in score.explanation
+    assert_harness_failure()
 
 
 def test_marker_inside_captured_candidate_output_cannot_hide_failure(monkeypatch):
@@ -205,7 +219,7 @@ def test_authenticated_failure_channels(monkeypatch, field, value):
     assert score.value == INCORRECT
 
 
-def test_setup_timeout_is_bounded_and_incorrect(monkeypatch):
+def test_setup_timeout_is_bounded_and_a_harness_error(monkeypatch):
     class HungSetup(FakeSandbox):
         async def exec(self, cmd, **kwargs):
             if cmd in (scoring.CLEANUP_COMMAND, scoring.QUIESCENCE_COMMAND):
@@ -214,9 +228,7 @@ def test_setup_timeout_is_bounded_and_incorrect(monkeypatch):
             assert kwargs["timeout"] == 5
             raise TimeoutError("private material")
     install_sandbox(monkeypatch, HungSetup([]))
-    score = asyncio.run(scoring.translation_scorer("java_to_cobol")(state(), Target("")))
-    assert score.value == INCORRECT
-    assert "private material" not in score.explanation
+    assert_harness_failure()
 
 
 @pytest.mark.parametrize('response', [result(), result('3'), result(returncode=7), '',
@@ -225,7 +237,10 @@ def test_setup_timeout_is_bounded_and_incorrect(monkeypatch):
 def test_uid_cleanup_is_a_separate_exec_on_every_run_outcome(monkeypatch, response):
     fake = FakeSandbox([response, response])
     install_sandbox(monkeypatch, fake)
-    asyncio.run(scoring.translation_scorer("java_to_cobol")(state(), Target('')))
+    if isinstance(response, (str, Exception)):
+        assert_harness_failure()
+    else:
+        asyncio.run(scoring.translation_scorer("java_to_cobol")(state(), Target('')))
     runs = [i for i, (cmd, _) in enumerate(fake.calls) if scoring.RUNNER in cmd]
     assert runs
     for index in runs:
@@ -253,9 +268,7 @@ def test_missing_receipt_waits_through_host_deadline_before_uid_sweep(monkeypatc
     monkeypatch.setattr(scoring.asyncio, 'sleep', wait)
     fake = MissingSupervisor([''])
     install_sandbox(monkeypatch, fake)
-    score = asyncio.run(scoring.translation_scorer("java_to_cobol")(state(), Target('')))
-    assert score.value == INCORRECT
-    assert score.explanation == 'Test 1: supervisor did not complete'
+    assert_harness_failure()
     assert events == ['deadline', 'sweep']
 
 
@@ -292,7 +305,8 @@ def test_scorer_cancellation_still_awaits_independent_uid_sweep(monkeypatch):
     assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
 
 
-@pytest.mark.parametrize('failure', [TimeoutError(), ConnectionError()])
+@pytest.mark.parametrize('failure', [TimeoutError(), ConnectionError(),
+                                   OutputLimitExceededError('private material', None)])
 def test_setup_failure_also_issues_uid_cleanup(monkeypatch, failure):
     class FailedSetup(FakeSandbox):
         async def exec(self, cmd, **kwargs):
@@ -302,11 +316,7 @@ def test_setup_failure_also_issues_uid_cleanup(monkeypatch, failure):
 
     fake = FailedSetup([])
     install_sandbox(monkeypatch, fake)
-    if isinstance(failure, TimeoutError):
-        assert asyncio.run(scoring.translation_scorer("java_to_cobol")(state(), Target(''))).value == INCORRECT
-    else:
-        with pytest.raises(RuntimeError, match='details withheld'):
-            asyncio.run(scoring.translation_scorer("java_to_cobol")(state(), Target('')))
+    assert_harness_failure()
     assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
 
 
@@ -325,7 +335,74 @@ def test_cleanup_requires_quiescence_before_reusing_sandbox(monkeypatch):
     assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
 
 
-def test_receipt_for_another_directory_is_incorrect(monkeypatch):
+def test_receipt_for_another_directory_is_a_harness_error(monkeypatch):
     fake = FakeSandbox([signed_receipt(bytes(range(32)), '/tmp/cjt-other')])
     install_sandbox(monkeypatch, fake)
-    assert asyncio.run(scoring.translation_scorer('java_to_cobol')(state(), Target(''))).value == INCORRECT
+    assert_harness_failure()
+
+
+@pytest.mark.parametrize('stage', ['setup', 'runner'])
+def test_exec_that_never_returns_is_a_harness_error_and_still_cleans_up(monkeypatch, stage):
+    timeout = asyncio.timeout
+    deadlines = []
+
+    def short_timeout(delay):
+        deadlines.append(delay)
+        return timeout(0.01)
+
+    class HungExec(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if (scoring.SETUP if stage == 'setup' else scoring.RUNNER) in cmd:
+                await asyncio.Event().wait()
+            return await super().exec(cmd, **kwargs)
+
+    fake = HungExec([])
+    install_sandbox(monkeypatch, fake)
+    monkeypatch.setattr(scoring.asyncio, 'timeout', short_timeout)
+    assert_harness_failure()
+    assert deadlines == ([10, 10, 10] if stage == 'setup' else [10, 105, 10, 10])
+    assert [cmd for cmd, _ in fake.calls[-2:]] == [scoring.CLEANUP_COMMAND, scoring.QUIESCENCE_COMMAND]
+
+
+@pytest.mark.parametrize('response', [
+    '',
+    '{"returncode":0,"output":"2"}',
+    signed_receipt(b'wrong key', '/tmp/cjt-fresh_1'),
+    signed_receipt(bytes(range(32)), '/tmp/cjt-fresh_1').replace('run', 'compile'),
+    signed_receipt(bytes(range(32)), '/tmp/cjt-other'),
+    TimeoutError('PRIVATE_EXCEPTION'),
+    OutputLimitExceededError('PRIVATE_STDOUT', 'PRIVATE_STDERR'),
+    ConnectionError('PRIVATE_STDIN PRIVATE_CODE'),
+], ids=['missing', 'unsigned', 'bad-signature', 'tampered', 'wrong-cwd',
+        'exec-timeout', 'output-limit', 'lost-response'])
+def test_receipt_rejection_is_an_inspect_sample_error_without_a_score(monkeypatch, tmp_path, response):
+    from inspect_ai import Task, eval
+    from inspect_ai.dataset import Sample
+    from inspect_ai.model import ModelOutput
+    from inspect_ai.solver import solver
+    from inspect_ai._util import appdirs
+
+    # Keep Inspect's trace files and caches inside the test's writable directory.
+    monkeypatch.setattr(appdirs, 'user_data_path', lambda package: tmp_path / 'data' / package)
+    monkeypatch.setattr(appdirs, 'user_cache_path', lambda package: tmp_path / 'cache' / package)
+
+    @solver
+    def candidate():
+        async def solve(task_state, generate):
+            task_state.output = ModelOutput.from_content('mockllm/model', state().output.completion)
+            return task_state
+        return solve
+
+    fake = FakeSandbox([response])
+    install_sandbox(monkeypatch, fake)
+    task = Task(dataset=[Sample(id='fixture', input='Translate the fixture.')],
+                solver=candidate(), scorer=scoring.translation_scorer('java_to_cobol'))
+    log, = eval(task, model='mockllm/model', log_dir=str(tmp_path), display='none',
+                fail_on_error=False)
+    sample, = log.samples
+    assert sample.error is not None
+    assert sample.error.message == repr(RuntimeError(WITHHELD))
+    assert not sample.scores
+    assert not any(event.event == 'score' for event in sample.events)
+    assert 'PRIVATE_' not in sample.error.model_dump_json()
+    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND

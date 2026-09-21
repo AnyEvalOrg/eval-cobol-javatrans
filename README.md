@@ -124,6 +124,12 @@ files, symlinks, FIFOs, and unsafe files fail. The receipt authenticates directo
 stage, exit status from wait(), timeout, overflow, and captured bytes with
 HMAC-SHA256. Candidate/provider completion markers cannot forge a successful
 receipt; provider success/returncode never decide the compile/run verdict.
+An absent or unverifiable receipt (including a wrong directory, lost exec response,
+or setup/supervisor exec timeout or output limit) is a harness failure: the scorer
+raises `RuntimeError("Private sandbox operation failed; details withheld.")`.
+Inspect records a sample error and AnyEval refuses to publish the run, so it does
+not enter the published pass rate. Candidate failures reported in authenticated
+receipts, including timeouts and output overflow, remain incorrect verdicts.
 
 `publication.py` preserves the template's private Inspect event proxy and
 context-local provider log filtering. Private sandbox calls produce no transcript
