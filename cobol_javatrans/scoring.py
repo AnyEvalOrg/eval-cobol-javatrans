@@ -16,6 +16,7 @@ from .dataset import load_records
 from .publication import private_grading
 from .sandbox_runner import CLEANUP_COMMAND, QUIESCENCE_COMMAND, DIRECTORY_CLEANUP_COMMAND, RUNNER, SETUP
 from .execution import execution_request
+from .sandbox_state import pod_identity, sandbox_failure
 from .cleaning import clean_java_response, clean_response_for_eval
 from .comparison import parse, is_equal
 
@@ -65,6 +66,8 @@ def translation_scorer(direction: str):
             # inside one root supervisor; no candidate-controlled driver verdict.
             deadline = payload['timeout'] + payload['run_timeout'] + 10
             receipt = None
+            kernel_score = None
+            setup_succeeded = False
             failure = None
             cleanup_failed = False
             cleanup_after = 0
@@ -86,6 +89,8 @@ def translation_scorer(direction: str):
                             raise RuntimeError("Invalid setup key")
                         if not re.fullmatch(r"/tmp/cjt-[a-zA-Z0-9_-]+", work):
                             raise RuntimeError("Invalid setup directory")
+                        setup_succeeded = True
+                        identity = pod_identity(private)
                         # If exec returns early without a receipt, wait through
                         # the outer deadline before sweeping: the supervisor may
                         # still be starting. This uses the host monotonic clock.
@@ -110,8 +115,7 @@ def translation_scorer(direction: str):
                             else:
                                 receipt = None
                         except Exception:
-                            # No authenticated supervisor report is a harness failure,
-                            # including a killed supervisor or lost exec response.
+                            # Kubernetes is the only remaining verdict channel.
                             receipt = None
                     finally:
                         # A separate sandbox exec, never the candidate's parent or
@@ -126,12 +130,25 @@ def translation_scorer(direction: str):
                             # Pods are per-sample and discarded afterwards: never
                             # reuse after failed cleanup, but retain signed failure.
                             cleanup_failed = True
+                    if setup_succeeded and receipt is None:
+                        kernel_score = await sandbox_failure(private, identity)
             except Exception:
                 # Provider exceptions may embed stdin or captured output. Do not
                 # allow them (or their exception chain) into an Inspect error event.
                 raise RuntimeError("Private sandbox operation failed; details withheld.") from None
             # Neither success nor returncode from the run provider is a verdict channel.
             if receipt is None:
+                if kernel_score is not None:
+                    return Score(value=kernel_score.value,
+                                 explanation=f"Test {index}: {kernel_score.explanation}")
+                # A Running pod plus exit 137/timeout is NOT proof that the
+                # candidate exceeded a supervisor deadline: the exec transport,
+                # node scheduling, or supervisor can fail identically. Calling
+                # it INCORRECT would admit infrastructure failures into the rate.
+                # Keep a withheld sample error (including timeout -s KILL).
+                # Publication must reject runs with ANY sample errors, as AnyEval
+                # does, rather than drop errored samples and publish a partial
+                # rate. Signed candidate timeouts and kernel OOMs remain verdicts.
                 raise RuntimeError("Private sandbox operation failed; details withheld.") from None
             if failure is not None:
                 return Score(value=INCORRECT, explanation=f"Test {index}: {failure}")

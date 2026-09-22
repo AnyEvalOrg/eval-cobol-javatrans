@@ -21,6 +21,7 @@ class _PrivateFilter(logging.Filter):
 # logger levels globally or suppressing concurrent samples' provenance diagnostics.
 for _name in (
     "k8s_sandbox._logger",
+    "kubernetes.client.rest",  # DEBUG response bodies can contain pod messages.
     "inspect_ai.util._sandbox.docker.compose",
     "inspect_ai.util._sandbox.docker.util",
     "inspect_ai.util._subprocess",

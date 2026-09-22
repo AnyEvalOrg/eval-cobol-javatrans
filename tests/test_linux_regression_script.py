@@ -234,3 +234,159 @@ def test_ptrace_regression_requires_specific_signed_denial(
     else:
         with pytest.raises(AssertionError):
             regressions.check_failure(regressions.PTRACE_DENIED)
+
+
+@pytest.mark.parametrize('outcome,status,oom_killed,passed', [
+    ('receipt', 0, False, True), ('disk_receipt', 0, False, True),
+    ('oom', 137, False, True), ('oom', 1, True, True), ('oom', 137, True, True),
+    ('bad_exit', 1, False, False), ('setup_failure', 137, True, False),
+    ('unsigned', 0, False, False), ('unclassified', 0, False, False),
+    ('receipt', 1, False, False), ('timeout', 0, False, False),
+    ('malformed', 1, False, False), ('inspect_failure', 137, False, False),
+])
+def test_docker_kernel_cases_accept_only_resource_receipt_or_sandbox_death(
+        monkeypatch, regressions, capsys, outcome, status, oom_killed, passed):
+    calls = []
+    summaries = [{'flags': {'setup_succeeded': True}}]
+    authenticated = outcome in ('receipt', 'disk_receipt', 'unclassified', 'timeout')
+    if authenticated:
+        summaries.append({'flags': {'authenticated': True, 'expected': True,
+            'memory_exceeded': outcome in ('receipt', 'timeout'),
+            'disk_exceeded': outcome == 'disk_receipt',
+            'timeout': outcome == 'timeout', 'PRIVATE': 'candidate-secret'}})
+    if outcome == 'setup_failure':
+        summaries = []
+
+    def invoke(command, **kwargs):
+        calls.append(command)
+        if command[1] == 'inspect':
+            return SimpleNamespace(returncode=1 if outcome == 'inspect_failure' else 0,
+                                   stdout='true\n' if oom_killed else 'false\n')
+        return SimpleNamespace(returncode=status, stderr='candidate-secret',
+            stdout='candidate-secret' if outcome == 'malformed' else '\n'.join(map(json.dumps, summaries)))
+
+    monkeypatch.setattr(regressions, 'invoke', invoke)
+    for case in regressions.KERNEL_CASES:
+        if passed:
+            regressions.docker_kernel_check('docker', 'image', case)
+        else:
+            with pytest.raises(SystemExit):
+                with regressions.check(case + ':docker'):
+                    regressions.docker_kernel_check('docker', 'image', case)
+    runs = calls[::3]
+    assert [c[-2:] for c in runs] == [['--kernel-child', case] for case in regressions.KERNEL_CASES]
+    assert len({c[c.index('--name') + 1] for c in runs}) == 3
+    assert all('--memory=2g' in c and '--memory-swap=2g' in c and '--rm' not in c for c in runs)
+    for run, inspect, cleanup in zip(runs, calls[1::3], calls[2::3]):
+        name = run[run.index('--name') + 1]
+        assert inspect == ['docker', 'inspect', '--format', '{{.State.OOMKilled}}', name]
+        assert cleanup == ['docker', 'rm', '-f', '-v', name]
+    output = capsys.readouterr().out
+    assert 'PRIVATE' not in output and 'candidate-secret' not in output
+    reports = [json.loads(line) for line in output.splitlines()]
+    diagnostics = [r for r in reports if 'error' not in r]
+    assert len(diagnostics) == 3
+    for case, report in zip(regressions.KERNEL_CASES, diagnostics):
+        assert report['step'] == case + ':docker'
+        assert report['returncode'] == status
+        flags = report['flags']
+        assert all(type(value) is bool for value in flags.values())
+        assert flags['authenticated'] == authenticated
+        assert flags['oom_killed'] == oom_killed
+        assert flags['sandbox_died'] == (status == 137 or oom_killed)
+    failures = [r for r in reports if 'error' in r]
+    assert len(failures) == (0 if passed else 3)
+    for case, failure in zip(regressions.KERNEL_CASES, failures):
+        assert failure['step'] == case + ':docker'
+        if outcome == 'malformed':
+            assert failure['error'] == 'JSONDecodeError'
+        else:
+            assert failure['error'] == 'AssertionError'
+            assert failure['label'] == ('setup-success' if outcome == 'setup_failure' else
+                'docker-inspect' if outcome == 'inspect_failure' else 'docker-child-success')
+
+
+@pytest.mark.parametrize('case', ['sysv_shm', 'memfd_mapped', 'socketpair_queues'])
+@pytest.mark.parametrize('changes,passed', [
+    ({'memory_exceeded': True}, True), ({'disk_exceeded': True}, True),
+    ({}, False), ({'memory_exceeded': True, 'timeout': True}, False),
+    ({'memory_exceeded': True, 'returncode': 0}, False),
+    ({'returncode': 0, 'output': 'sysv shm unsupported\n'}, False),
+])
+def test_kernel_child_requires_signed_resource_limit(
+        monkeypatch, regressions, capsys, case, changes, passed):
+    receipt = dict(stage='run', returncode=-9, output='candidate-secret')
+    receipt.update(changes)
+    monkeypatch.setattr(regressions.sys, 'argv', ['linux_regressions.py', '--kernel-child', case])
+    monkeypatch.setattr(regressions.sys, 'platform', 'linux')
+    monkeypatch.setattr(regressions.os, 'geteuid', lambda: 0)
+    monkeypatch.setattr(regressions, 'execute', lambda *a, **kw: receipt)
+    if passed:
+        regressions.main()
+    else:
+        with pytest.raises(SystemExit):
+            regressions.main()
+    output = capsys.readouterr().out
+    assert 'candidate-secret' not in output
+    reports = list(map(json.loads, output.splitlines()))
+    assert reports[0]['flags']['authenticated'] is True
+    assert reports[0]['flags']['expected'] == passed
+    if not passed:
+        assert reports[1]['step'] == case + ':docker-child'
+        assert reports[1]['label'] == 'failure-classified'
+
+
+def test_kernel_candidates_use_retained_sinks_and_compile(regressions):
+    for name, code in regressions.KERNEL_CASES.items():
+        compile(code, name, 'exec')  # Never execute memory hogs on the test host.
+    assert 'libc.shmdt(address)' in regressions.SYSV_SHM
+    assert 'libc.shmctl' not in regressions.SYSV_SHM
+    assert 'libc.mmap(None, 4096, 0, 1, fd, 0)' in regressions.MEMFD_MAPPED
+    assert 'os.close(fd)' in regressions.MEMFD_MAPPED
+    assert 'socket.socketpair()' in regressions.SOCKETPAIR_QUEUES
+
+
+@pytest.mark.parametrize('outcome', ['signed', 'runner_137', 'missing', 'setup_failure'])
+def test_disposable_child_authenticates_or_exits_137_only_after_setup(monkeypatch, regressions, capsys, outcome):
+    key = bytes(range(32))
+    calls = []
+    from test_scoring import signed_receipt
+    def invoke(command, **kwargs):
+        calls.append(command)
+        if regressions.SETUP in command:
+            return SimpleNamespace(returncode=1 if outcome == 'setup_failure' else 0,
+                stdout=json.dumps(dict(cwd='/tmp/cjt-disposable', key=key.hex())))
+        if regressions.RUNNER in command:
+            return SimpleNamespace(returncode=137 if outcome == 'runner_137' else 0,
+                stdout=signed_receipt(key, '/tmp/cjt-disposable', returncode=-9, memory_exceeded=True)
+                if outcome == 'signed' else '')
+        assert command == regressions.QUIESCENCE_CHECK_COMMAND
+        return SimpleNamespace(returncode=0, stdout='')
+    monkeypatch.setattr(regressions, 'invoke', invoke)
+    if outcome == 'signed':
+        receipt = regressions.execute(regressions.request_for(regressions.MEMFD_MAPPED), disposable=True)
+        assert receipt['memory_exceeded']
+    elif outcome == 'runner_137':
+        with pytest.raises(SystemExit) as raised:
+            regressions.execute(regressions.request_for(regressions.MEMFD_MAPPED), disposable=True)
+        assert raised.value.code == 137
+    else:
+        with pytest.raises(AssertionError):
+            regressions.execute(regressions.request_for(regressions.MEMFD_MAPPED), disposable=True)
+    output = capsys.readouterr().out
+    assert output == ('' if outcome == 'setup_failure' else '{"flags": {"setup_succeeded": true}}\n')
+    assert not any(command == regressions.CLEANUP_COMMAND for command in calls)
+    assert key.hex() not in output
+
+
+def test_docker_main_runs_kernel_cases_last(monkeypatch, regressions):
+    events = []
+    monkeypatch.setattr(regressions.sys, 'argv', ['linux_regressions.py', '--image', 'image', '--docker-cli', 'docker'])
+    monkeypatch.setattr(regressions.sys, 'platform', 'linux')
+    monkeypatch.setattr(regressions.os, 'geteuid', lambda: 0)
+    monkeypatch.setattr(regressions, 'compiler_smokes', lambda: events.append('compilers'))
+    monkeypatch.setattr(regressions, 'check_failure', lambda *args, **kwargs: events.append('watchdog'))
+    monkeypatch.setattr(regressions, 'docker_memory_check', lambda *args: events.append('docker_watchdogs'))
+    monkeypatch.setattr(regressions, 'docker_kernel_check', lambda docker, image, case: events.append(case))
+    regressions.main()
+    assert events[-4:] == ['docker_watchdogs', *regressions.KERNEL_CASES]

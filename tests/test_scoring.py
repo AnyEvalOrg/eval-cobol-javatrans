@@ -523,3 +523,56 @@ def test_nonzero_setup_is_withheld_harness_error_without_candidate_launch(monkey
     install_sandbox(monkeypatch, fake)
     assert_harness_failure()
     assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND
+
+
+@pytest.mark.parametrize('kind', ['java_to_cobol', 'cobol_to_java'])
+@pytest.mark.parametrize('response', ['', TimeoutError('PRIVATE'), ConnectionError('PRIVATE'), result('', 137)])
+@pytest.mark.parametrize('resource', ['memory', 'storage', None])
+def test_missing_receipt_uses_only_kernel_evidence_after_setup(monkeypatch, kind, response, resource):
+    from cobol_javatrans.sandbox_state import classify_pod, MEMORY_FAILURE, STORAGE_FAILURE
+    from test_sandbox_state import pod
+    calls = []
+
+    class FailedCleanup(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if cmd == scoring.CLEANUP_COMMAND:
+                raise ConnectionError('PRIVATE CLEANUP')
+            if scoring.RUNNER in cmd and not isinstance(response, (str, Exception)):
+                return response  # Provider exit 137 with no receipt, not signed.
+            return await super().exec(cmd, **kwargs)
+
+    fake = FailedCleanup([response])
+    install_sandbox(monkeypatch, fake)
+    async def lookup(env, identity):
+        calls.append(env)
+        evidence = pod(terminated='OOMKilled') if resource == 'memory' else (
+            pod(phase='Failed', reason='Evicted', message='ephemeral-storage PRIVATE')
+            if resource == 'storage' else pod())
+        return classify_pod(evidence)
+    monkeypatch.setattr(scoring, 'sandbox_failure', lookup)
+    if resource is None:
+        assert_harness_failure(kind)
+    else:
+        score = asyncio.run(scoring.translation_scorer(kind)(state(kind), Target('')))
+        assert score.value == INCORRECT
+        assert score.explanation == 'Test 1: ' + (MEMORY_FAILURE if resource == 'memory' else STORAGE_FAILURE)
+    assert len(calls) == 1 and len(fake.paths) == 1
+
+
+@pytest.mark.parametrize('stage', ['failed_setup', 'malformed_setup', 'signed_run'])
+def test_kernel_lookup_is_never_used_without_successful_setup_and_missing_receipt(monkeypatch, stage):
+    class Environment(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if scoring.SETUP in cmd and stage != 'signed_run':
+                return result('{}', returncode=1 if stage == 'failed_setup' else 0)
+            return await super().exec(cmd, **kwargs)
+
+    async def forbidden(*args):
+        pytest.fail('kernel classification was not authorized')
+    monkeypatch.setattr(scoring, 'sandbox_failure', forbidden)
+    install_sandbox(monkeypatch, Environment([result(returncode=1)]))
+    if stage == 'signed_run':
+        score = asyncio.run(scoring.translation_scorer('java_to_cobol')(state(), Target('')))
+        assert score.value == INCORRECT
+    else:
+        assert_harness_failure()

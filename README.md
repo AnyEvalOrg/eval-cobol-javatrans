@@ -161,8 +161,8 @@ verification. A third independent exec deletes `/tmp/cjt-*` using
 The scorer decides the signed verdict first. If independent cleanup or deletion
 fails, a signed failure retains its INCORRECT explanation; a signed success
 becomes INCORRECT with `candidate left processes that could not be cleaned up`.
-No further test runs after failed cleanup. Only an absent valid signed receipt
-causes the withheld-details harness error, including when cleanup also fails.
+No further test runs after failed cleanup. An absent valid signed receipt uses
+the Kubernetes backstop below, including when cleanup also fails.
 Each pod belongs to one sample and is discarded afterwards, with no reuse across
 samples. UID 65532 must be reserved solely for candidates; tests execute
 sequentially. An unauthenticated run waits through its host deadline before cleanup
@@ -182,11 +182,37 @@ files, symlinks, FIFOs, and unsafe files fail. The receipt authenticates directo
 stage, exit status from wait(), timeout, overflow, aggregate memory exhaustion,
 cleanup/supervisor failures, and captured bytes with HMAC-SHA256. Candidate/provider completion markers cannot forge a successful
 receipt; provider success/returncode never decide the compile/run verdict.
-An absent or unverifiable receipt (including a wrong directory, lost exec response,
-or setup/supervisor exec timeout or output limit) is a harness failure: the scorer
-raises `RuntimeError("Private sandbox operation failed; details withheld.")`.
-Inspect records a sample error and AnyEval refuses to publish the run, so it does
-not enter the published pass rate. Candidate failures reported in authenticated
+After successful SETUP, an absent or unverifiable RUNNER receipt (including a
+wrong directory, lost exec response, timeout, or output limit) triggers a bounded
+Kubernetes status lookup in `sandbox_state.py`. It snapshots the provider's pod
+identity before RUNNER and uses the provider's Kubernetes client, namespace, and
+kubeconfig context. A different pod UID is never attributed to the candidate.
+Container `state.terminated` or `lastState.terminated` reason `OOMKilled` scores
+INCORRECT with `Test N: sandbox memory exhausted during candidate execution`.
+The same verdict applies to a container terminated with exit code 137 or signal 9
+when the lookup matches the captured pod UID and the pod is not Evicted. A host
+cgroup memory kill of the runsc sandbox can be reported by containerd as reason
+`Error` with exit 137 rather than `OOMKilled`. This requires Kubernetes container
+termination evidence, not a RUNNER/provider exit code. Spot preemption deleting
+the pod yields 404; NodeNotReady with a Running/Unknown pod and no terminated
+container state supplies no memory evidence. Both remain harness errors.
+A Failed/Evicted pod whose message names `ephemeral-storage` scores INCORRECT with
+`Test N: sandbox storage exhausted during candidate execution`. These verdicts
+survive failed independent cleanup. The lookup has a four-second host deadline,
+short HTTP timeouts, and bounded daemon workers so even a stuck credential helper
+cannot block scoring. No pod message, API body, or lookup exception is published.
+
+SETUP failure always remains infrastructure. All other missing-receipt outcomes
+(pod gone/replaced, NodeNotReady, Spot preemption, other node-pressure eviction,
+a Running pod without container termination evidence, or a failed/timed-out lookup) raise
+`RuntimeError("Private sandbox operation failed; details withheld.")`.
+A Running pod without container termination after `timeout -s KILL` is also a harness error: an unauthenticated
+exit 137 cannot distinguish candidate slowness from transport, scheduling, or
+supervisor failure. Signed candidate timeouts still score INCORRECT. Inspect
+records a sample error and AnyEval refuses to publish the entire run; errored
+samples must never be silently dropped to publish a partial pass rate. This keeps
+harness failures out of the rate without letting missing receipts remove selected
+samples from a published result. Candidate failures reported in authenticated
 receipts, including timeouts, memory exhaustion, output overflow, post-run/cleanup
 failures, and undecodable output, remain incorrect verdicts. Raw candidate bytes are base64
 encoded before signing. The verifier authenticates the envelope and strictly
@@ -252,7 +278,13 @@ bursts, cache and the supervisor. RSS/file accounting can overlap, conservativel
 The limits are sampled, not synchronous quotas; neither gVisor Memory `emptyDir`
 sizeLimit nor disk `emptyDir` sizeLimit is relied on as a synchronous write bound.
 The disk mount's 512 MiB eviction backstop and pod's 1 GiB ephemeral-storage budget
-remain additional backstops; memfds are counted by the watchdog, not disk eviction.
+remain additional backstops. Descriptor-retained memfds are counted by the
+watchdog, not disk eviction. This accounting is not exhaustive: detached SysV
+shared memory, files retained only by tiny PROT_NONE mappings, socket queues,
+pipes, and POSIX mqueues can retain kernel memory outside these scans. The
+Kubernetes classifier is the backstop for such unenumerated memory; watchdogs
+remain useful for signing common failures and keeping the pod alive. The headroom
+arithmetic above is not a proof that arbitrary candidates cannot OOM the pod.
 Autopilot supplies the Spot toleration; the chart adds none. The task defaults
 `INSPECT_K8S_DEFAULT_NAMESPACE` to `anyeval-sandbox` without overriding an existing
 setting. Both chart paths and Compose give trusted root execs only SETUID, SETGID,
@@ -313,7 +345,7 @@ unbounded 1 MiB file writes until the disk watchdog kills the candidate. Additio
 cases retain 300 unlinked one-MiB files across four workers, retain 300 MiB in
 memfds across four workers, create 50,000 empty files, and attempt `/dev/shm`
 writes. The first three must sign `disk_exceeded`; the read-only `/dev/shm` attempt
-must exit 1 with no failure flags. Every case checks the receipt deadline and a
+must exit 1 with no failure flags. These watchdog cases check the receipt deadline and a
 fresh exec after independent cleanup. Each attack must produce an authenticated
 INCORRECT outcome; success logs contain only stage, returncode, and boolean flags.
 Regression failures additionally name the check (`step`, such as
@@ -336,12 +368,23 @@ does **not** attest cgroup OOM behavior. Docker availability with a broken daemo
 is a failure, not a fallback. The checkout must be mounted at the same absolute
 path on the Docker daemon host and in the script's container.
 
+Docker runs three additional cases **last**, each in a separate disposable
+container: 64 MiB SysV segments filled and detached without IPC_RMID; one-MiB
+memfds retained by 4 KiB PROT_NONE mappings after close; and filled socketpair
+queues. After a fixed setup-success flag, they require either a signed
+`memory_exceeded`/`disk_exceeded` receipt with nested exit 0, or sandbox death
+(nested exit 137 or Docker's inspected `OOMKilled` state). Named containers
+remain available for inspection before explicit removal, including their volumes.
+Each case prints its step, nested exit code, and allowlisted boolean flags, even
+on failure; candidate output is never printed. Exit 137 alone does not prove the
+Kubernetes classification. The prlimit fallback does not run these destructive cases.
+
 The operator-only Inspect task `scripts/k8s_regressions.py` uses the exact package
 Kubernetes chart and values (gVisor, deny-all egress, read-only root, disk-backed
 `/tmp` and read-only Memory `/dev/shm`). It is not registered as a package task. With the operator's `KUBECONFIG`:
 
 ```bash
-inspect eval scripts/k8s_regressions.py --model mockllm/model
+inspect eval scripts/k8s_regressions.py --model mockllm/model --max-samples 1
 ```
 
 It runs the real SETUP + RUNNER against invalid UTF-8, fork exhaustion, three
@@ -350,9 +393,31 @@ write attempt, and a zero-exit parent leaving a
 `setsid` child sleeping. CORRECT requires every signed receipt to match its
 expected flags within the receipt deadline, independent cleanup to succeed, and a fresh sandbox exec to
 confirm the pod remains usable after each case. Its JSON summary contains only
-boolean flags, never candidate output, receipts, or keys. This production-runtime
-check, including actual gVisor disk-watchdog containment, requires a live cluster;
-local protocol tests do not attest it.
+boolean flags, never candidate output, receipts, or keys.
+
+The task then runs the three kernel-memory cases above as three separate Samples
+(and therefore three fresh pods), after the original containment Sample. Solver
+barriers preserve this order even when Inspect schedules concurrently; run the
+complete task, without filtering/shuffling its samples. A kernel case passes with
+a timely authenticated `memory_exceeded`/`disk_exceeded` receipt plus successful
+cleanup/probe, or with no receipt and pod termination evidence (`OOMKilled`, or
+exit 137/signal 9 on the same non-Evicted pod) mapped by the production classifier
+to INCORRECT. Only SysV's authenticated unsupported
+report is exempt. A timeout with a Running pod, other eviction, lookup failure,
+or SETUP failure cannot pass. Destructive pods are discarded even if they survive.
+For missing receipts after SETUP, sample metadata `regression_evidence` records
+only allowlisted evidence from the same captured-identity lookup used for
+classification: pod phase/reason/message and each container's current/previous
+terminated reason, exitCode, signal, and message. Messages are kubelet text,
+truncated to 200 characters. Lookup failures retain only the exception class and
+a separate 404/pod-gone flag. `runner_exec_to_lookup_seconds` measures the delay
+from RUNNER exec failure (or return without an authenticated receipt) to lookup
+start, including cleanup. The printed `regression_flags` remain boolean-only;
+`oom_killed` still means the literal reason, while `candidate_incorrect` includes
+the additional memory-exhaustion branch. Production scoring publishes none of
+these diagnostics.
+This production-runtime check requires a live cluster; local protocol tests do
+not attest gVisor OOM behavior.
 
 Operators can run the full Docker regression via Cloud Build (substitute the
 reference image digest). The supplied build uses the Docker builder's client and
